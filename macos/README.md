@@ -7,7 +7,7 @@ Wine、Rosetta、チューナー用ドライバは不要です。
 
 ## ビルド
 
-macOS 12 以降と Xcode または Xcode Command Line Tools が必要です。
+macOS 14 以降と CMake 3.20 以降、Xcode または Xcode Command Line Tools が必要です。
 [VideoLAN の macOS 用 VLC 3](https://www.videolan.org/vlc/download-macosx.html) を
 `/Applications/VLC.app` に置いてください。VLC 本体を起動する必要はありませんが、
 ビルド後もライブラリとコーデックを参照するため、同じ場所に残してください。
@@ -15,19 +15,24 @@ macOS 12 以降と Xcode または Xcode Command Line Tools が必要です。
 同じ親ディレクトリに両フォークをチェックアウトします。
 
 ```sh
-git clone --branch macos https://github.com/soralis0912/TVTest.git
+git clone --recurse-submodules --branch macos https://github.com/soralis0912/TVTest.git
 git clone --branch macos https://github.com/soralis0912/TvtPlay.git
 make -C TVTest/macos
 open TVTest/macos/build/TVTest.app
 ```
 
-すでに両方のフォークがある場合は、各リポジトリの `macos` ブランチを使ってビルドします。
+すでに両方のフォークがある場合は、各リポジトリの `macos` ブランチを使い、TVTest で `git submodule sync` と
+`git submodule update --init` を実行してからビルドします。
 別の場所に配置した場合は、`make` に `TVTPLAY_DIR=/path/to/TvtPlay/macos/plugin` や
 `VLC_APP=/path/to/VLC.app` を指定できます。
 
 ## 開く
 
 TVTest で ⌘O を押して `.m2ts`、`.ts`、`.m2t`、`.mts` を選びます。
+再生中に **⌘I** を押すと、LibISDB が録画の先頭 32 MiB を解析し、
+サービス名と、放送波に含まれる現在・次の番組情報を表示します。
+表示内容は録画の先頭付近の放送情報に基づきます。
+
 ターミナルから直接開くこともできます。
 
 ```sh

@@ -16,7 +16,7 @@
             <key>LSHandlerRank</key><string>Alternate</string>
         </dict>
     </array>
-    <key>LSMinimumSystemVersion</key><string>12.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

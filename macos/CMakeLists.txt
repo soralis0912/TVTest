@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum supported macOS version")
+project(TVTestMac LANGUAGES CXX OBJCXX)
+
+add_subdirectory(../src/LibISDB/LibISDB LibISDB)
+add_executable(TVTest main.mm RecordingInfo.mm)
+set_target_properties(TVTest PROPERTIES OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED YES)
+target_compile_options(TVTest PRIVATE -fobjc-arc -Wall -Wextra)
+target_include_directories(TVTest PRIVATE ../src/LibISDB/LibISDB)
+target_link_libraries(TVTest PRIVATE LibISDB "-framework AppKit" "-framework UniformTypeIdentifiers")

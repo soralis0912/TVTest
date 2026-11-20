@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TVTestPlaybackPlugin.h"
+#import "RecordingInfo.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 @interface TVTestApp : NSObject <NSApplicationDelegate>
@@ -9,6 +10,8 @@
     NSWindow *_window;
     id<TVTestPlaybackPlugin> _plugin;
     NSURL *_pendingRecording;
+    NSURL *_recording;
+    NSProgress *_infoJob;
 }
 
 - (void)applicationWillFinishLaunching:(NSNotification *)notification {
@@ -23,6 +26,10 @@
                                                     action:@selector(chooseRecording:)
                                              keyEquivalent:@"o"];
     open.target = self;
+    NSMenuItem *info = [fileItem.submenu addItemWithTitle:@"番組情報…"
+                                                    action:@selector(showRecordingInfo:)
+                                             keyEquivalent:@"i"];
+    info.target = self;
     NSApp.mainMenu = menu;
 }
 
@@ -73,6 +80,7 @@
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [_infoJob cancel];
     _plugin = nil;
 }
 
@@ -110,7 +118,87 @@
         [self showError:error.localizedDescription ?: @"TvtPlay を読み込めませんでした。"];
         return;
     }
+    [_infoJob cancel];
+    _infoJob = nil;
+    _recording = url;
     _window.title = [NSString stringWithFormat:@"%@ — TVTest", url.lastPathComponent];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(showRecordingInfo:)) {
+        return _recording && !_infoJob;
+    }
+    return YES;
+}
+
+- (void)showRecordingInfo:(id)sender {
+    if (!_recording || _infoJob) {
+        return;
+    }
+    NSURL *recording = _recording;
+    NSProgress *job = [NSProgress progressWithTotalUnitCount:0];
+    _infoJob = job;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSArray<NSDictionary<NSString *, id> *> *services = TVTestReadRecordingInfo(recording, job, &error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_infoJob != job) {
+                return;
+            }
+            self->_infoJob = nil;
+            if (error) {
+                [self showError:error.localizedDescription];
+            } else {
+                [self presentServices:services forRecording:recording];
+            }
+        });
+    });
+}
+
+- (void)presentServices:(NSArray<NSDictionary<NSString *, id> *> *)services forRecording:(NSURL *)recording {
+    NSMutableArray<NSString *> *sections = [NSMutableArray array];
+    for (NSDictionary<NSString *, id> *service in services) {
+        NSString *name = service[@"name"];
+        NSString *current = service[@"current"];
+        NSString *description = service[@"description"];
+        NSString *next = service[@"next"];
+        NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:
+            [NSString stringWithFormat:@"%@ (SID %u)", name.length ? name : @"サービス",
+              [service[@"serviceID"] unsignedIntValue]]];
+        if (current.length) {
+            [lines addObject:[@"現在の番組  " stringByAppendingString:current]];
+        }
+        if (description.length) {
+            [lines addObject:description];
+        }
+        if (next.length) {
+            [lines addObject:[@"次の番組  " stringByAppendingString:next]];
+        }
+        if (!current.length && !next.length) {
+            [lines addObject:@"番組情報が含まれていません。"];
+        }
+        [sections addObject:[lines componentsJoinedByString:@"\n"]];
+    }
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"番組情報";
+    alert.informativeText = recording.lastPathComponent;
+    [alert addButtonWithTitle:@"閉じる"];
+    if (sections.count == 0) {
+        alert.informativeText = @"録画の先頭からサービス情報を取得できませんでした。";
+    } else {
+        NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 420, 180)];
+        scroll.hasVerticalScroller = YES;
+        NSTextView *text = [[NSTextView alloc] initWithFrame:scroll.contentView.bounds];
+        text.editable = NO;
+        text.verticallyResizable = YES;
+        text.autoresizingMask = NSViewWidthSizable;
+        text.textContainer.widthTracksTextView = YES;
+        text.font = [NSFont systemFontOfSize:NSFont.systemFontSize];
+        text.string = [sections componentsJoinedByString:@"\n\n"];
+        scroll.documentView = text;
+        alert.accessoryView = scroll;
+    }
+    [alert beginSheetModalForWindow:_window completionHandler:nil];
 }
 
 - (void)showError:(NSString *)message {

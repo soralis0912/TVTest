@@ -1,15 +1,19 @@
+CMAKE ?= cmake
+BUILD_JOBS ?= 8
 TVTPLAY_DIR ?= ../../TvtPlay/macos/plugin
 APP := build/TVTest.app
 CONTENTS := $(APP)/Contents
 PLUGIN := $(abspath $(CONTENTS)/PlugIns/TvtPlay.bundle)
 
-.PHONY: all host plugin
+.PHONY: all host plugin host-binary
 all: host plugin
-host: $(CONTENTS)/MacOS/TVTest $(CONTENTS)/Info.plist
+host: host-binary $(CONTENTS)/Info.plist
 
-$(CONTENTS)/MacOS/TVTest: main.m TVTestPlaybackPlugin.h Makefile
-	mkdir -p "$(@D)"
-	xcrun clang -fobjc-arc -mmacosx-version-min=12.0 -Wall -Wextra -O2 -framework AppKit -framework UniformTypeIdentifiers main.m -o "$@"
+host-binary:
+	$(CMAKE) -S . -B build/native -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build build/native --parallel $(BUILD_JOBS)
+	mkdir -p "$(CONTENTS)/MacOS"
+	install -m 755 build/native/TVTest "$(CONTENTS)/MacOS/TVTest"
 
 $(CONTENTS)/Info.plist: Info.plist
 	mkdir -p "$(@D)"

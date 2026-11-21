@@ -26,6 +26,7 @@ static NSColor *EPGGenreColor(uint8_t level1) {
 @interface TVTestEPGGridView : NSView
 @property (nonatomic, copy) NSArray<TVTestEPGServiceEntry *> *services;
 @property (nonatomic, copy, nullable) void (^onSelectEvent)(TVTestEPGEvent *event);
+@property (nonatomic, copy, nullable) void (^onDoubleClickServiceID)(uint16_t serviceID);
 @property (nonatomic, nullable) TVTestEPGEvent *selectedEvent;
 @end
 
@@ -186,6 +187,13 @@ static NSColor *EPGGenreColor(uint8_t level1) {
 
 - (void)mouseDown:(NSEvent *)event {
     NSPoint pt = [self convertPoint:event.locationInWindow fromView:nil];
+    if (event.clickCount == 2 && pt.x >= _rulerWidth && _services.count > 0) {
+        NSUInteger col = (NSUInteger)((pt.x - _rulerWidth) / _columnWidth);
+        if (col < _services.count && _onDoubleClickServiceID) {
+            _onDoubleClickServiceID(_services[col].serviceID);
+            return;
+        }
+    }
     for (NSUInteger col = 0; col < _services.count; ++col) {
         for (TVTestEPGEvent *ev in _services[col].events) {
             NSRect box = [self rectForEvent:ev columnIndex:col];
@@ -211,6 +219,7 @@ static NSColor *EPGGenreColor(uint8_t level1) {
     NSPopUpButton *_servicePopup;
     NSSearchField *_searchField;
     NSTextField *_statusLabel;
+    NSButton *_acquireEPGButton;
     NSButton *_exportJSONButton;
 
     NSTabView *_contentTabs;
@@ -271,11 +280,14 @@ static NSColor *EPGGenreColor(uint8_t level1) {
     [_statusLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired
                                            forOrientation:NSLayoutConstraintOrientationHorizontal];
 
+    _acquireEPGButton = [NSButton buttonWithTitle:@"EPG 取得" target:self action:@selector(acquireEPG:)];
+    _acquireEPGButton.translatesAutoresizingMaskIntoConstraints = NO;
+
     _exportJSONButton = [NSButton buttonWithTitle:@"JSON出力…" target:self action:@selector(exportJSON:)];
     _exportJSONButton.translatesAutoresizingMaskIntoConstraints = NO;
 
     NSStackView *toolbar = [NSStackView stackViewWithViews:@[
-        _modeControl, _servicePopup, _searchField, _statusLabel, _exportJSONButton
+        _modeControl, _servicePopup, _searchField, _statusLabel, _acquireEPGButton, _exportJSONButton
     ]];
     toolbar.spacing = 10;
     toolbar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -302,6 +314,9 @@ static NSColor *EPGGenreColor(uint8_t level1) {
     _gridView.onSelectEvent = ^(TVTestEPGEvent *ev) {
         [weakSelf showDetailForEvent:ev];
     };
+    _gridView.onDoubleClickServiceID = ^(uint16_t sid) {
+        [weakSelf requestTuneServiceID:sid];
+    };
     gridScroll.documentView = _gridView;
     gridTab.view = gridScroll;
     [_contentTabs addTabViewItem:gridTab];
@@ -316,6 +331,8 @@ static NSColor *EPGGenreColor(uint8_t level1) {
     _tableView.usesAlternatingRowBackgroundColors = YES;
     _tableView.dataSource = self;
     _tableView.delegate = self;
+    _tableView.target = self;
+    _tableView.doubleAction = @selector(tableDoubleClicked:);
 
     NSTableColumn *dateCol = [[NSTableColumn alloc] initWithIdentifier:@"date"];
     dateCol.title = @"日付";
@@ -578,6 +595,33 @@ static NSColor *EPGGenreColor(uint8_t level1) {
     NSInteger row = _tableView.selectedRow;
     if (row >= 0 && (NSUInteger)row < _filteredEvents.count) {
         [self showDetailForEvent:_filteredEvents[(NSUInteger)row]];
+    }
+}
+
+- (void)setEPGAcquisitionStatus:(nullable NSString *)status acquiring:(BOOL)acquiring {
+    _acquireEPGButton.title = acquiring ? @"取得中止" : @"EPG 取得";
+    if (status.length) {
+        _statusLabel.stringValue = status;
+    }
+}
+
+- (void)acquireEPG:(id)sender {
+    (void)sender;
+    if ([_delegate respondsToSelector:@selector(programGuideDidRequestAcquireEPG)]) {
+        [_delegate programGuideDidRequestAcquireEPG];
+    }
+}
+
+- (void)requestTuneServiceID:(uint16_t)serviceID {
+    if (serviceID != 0 && [_delegate respondsToSelector:@selector(programGuideDidRequestTuneServiceID:)]) {
+        [_delegate programGuideDidRequestTuneServiceID:serviceID];
+    }
+}
+
+- (void)tableDoubleClicked:(id)sender {
+    (void)sender;
+    if (_selectedServiceID != 0) {
+        [self requestTuneServiceID:_selectedServiceID];
     }
 }
 

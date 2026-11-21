@@ -11,6 +11,12 @@ typedef NS_ENUM(NSInteger, TVTestStartupDriverMode) {
     TVTestStartupDriverModeSpecified = 2,
 };
 
+typedef NS_ENUM(NSInteger, TVTestCasReaderMode) {
+    TVTestCasReaderModeAuto = 0,          // Built-in MacBonDriver reader first, fallback to PC/SC
+    TVTestCasReaderModeDriverBuiltIn = 1, // Built-in MacBonDriverSmartCard only (e.g. XIT-SQR100)
+    TVTestCasReaderModePCSC = 2,          // macOS PCSC.framework USB smart card reader
+};
+
 @interface TVTestSettings : NSObject
 + (instancetype)sharedSettings;
 
@@ -32,9 +38,19 @@ typedef NS_ENUM(NSInteger, TVTestStartupDriverMode) {
 @property (nonatomic) NSInteger defaultLNBPowerMode;
 @property (nonatomic) BOOL autoTuneOnDriverOpen;
 
+// CAS / B-CAS (TvCas)
+@property (nonatomic) BOOL enableDescramble;
+@property (nonatomic) TVTestCasReaderMode casReaderMode;
+@property (nonatomic, copy, nullable) NSString *casPCSCReaderName;
+@property (nonatomic) BOOL enableEMMProcess;
+
 // View / Video / Audio
 @property (nonatomic) BOOL osdEnabled;
 @property (nonatomic) BOOL alwaysOnTop;
+@property (nonatomic) BOOL framelessWindow;
+@property (nonatomic) BOOL muteWhenMinimized;
+@property (nonatomic, copy, nullable) NSString *windowFrameString;
+@property (nonatomic, copy, nullable) NSDictionary<NSString *, id> *lastTunedChannelEntry;
 @property (nonatomic) BOOL panelVisible;
 @property (nonatomic) BOOL panelOnLeft;
 @property (nonatomic) NSInteger selectedPanelTab;

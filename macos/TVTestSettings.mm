@@ -38,7 +38,12 @@ static NSString *SanitizeFilenameComponent(NSString *input) {
         NSString *pictures = [NSHomeDirectory() stringByAppendingPathComponent:@"Pictures/TVTest"];
         NSString *movies = [NSHomeDirectory() stringByAppendingPathComponent:@"Movies/TVTest"];
         NSString *bonDrivers = [self.applicationSupportDirectory stringByAppendingPathComponent:@"BonDrivers"];
+        NSString *plugIns = [self.applicationSupportDirectory stringByAppendingPathComponent:@"PlugIns"];
         [NSFileManager.defaultManager createDirectoryAtPath:bonDrivers
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:NULL];
+        [NSFileManager.defaultManager createDirectoryAtPath:plugIns
                                 withIntermediateDirectories:YES
                                                  attributes:nil
                                                       error:NULL];
@@ -57,11 +62,18 @@ static NSString *SanitizeFilenameComponent(NSString *input) {
             @"bonDriverCustomFirmwareDir": @"",
             @"defaultLNBPowerMode": @(MBDLNBPowerOff),
             @"autoTuneOnDriverOpen": @YES,
+            @"enableDescramble": @YES,
+            @"casReaderMode": @(TVTestCasReaderModeAuto),
+            @"casPCSCReaderName": @"",
+            @"enableEMMProcess": @NO,
             @"captionsEnabled": @YES,
             @"captionFontSize": @22.0,
             @"captionBackgroundAlpha": @0.72,
             @"osdEnabled": @YES,
             @"alwaysOnTop": @NO,
+            @"framelessWindow": @NO,
+            @"muteWhenMinimized": @YES,
+            @"windowFrameString": @"",
             @"panelVisible": @YES,
             @"panelOnLeft": @NO,
             @"selectedPanelTab": @0,
@@ -116,13 +128,15 @@ static NSString *SanitizeFilenameComponent(NSString *input) {
 
 - (NSArray<NSString *> *)bonDriverSearchDirectories {
     NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-    NSString *bundled = [[NSBundle.mainBundle.builtInPlugInsURL URLByAppendingPathComponent:@"BonDrivers"] path];
-    if (bundled.length) [dirs addObject:bundled];
     NSString *custom = self.bonDriverDirectory;
     if (custom.length) [dirs addObject:custom];
     NSString *appSupportBon = [self.applicationSupportDirectory stringByAppendingPathComponent:@"BonDrivers"];
     if (appSupportBon.length && ![dirs containsObject:appSupportBon]) {
         [dirs addObject:appSupportBon];
+    }
+    NSString *bundled = [[NSBundle.mainBundle.builtInPlugInsURL URLByAppendingPathComponent:@"BonDrivers"] path];
+    if (bundled.length && ![dirs containsObject:bundled]) {
+        [dirs addObject:bundled];
     }
     return dirs;
 }
@@ -181,6 +195,21 @@ static NSString *SanitizeFilenameComponent(NSString *input) {
 - (BOOL)autoTuneOnDriverOpen { return [_defaults boolForKey:@"autoTuneOnDriverOpen"]; }
 - (void)setAutoTuneOnDriverOpen:(BOOL)v { [_defaults setBool:v forKey:@"autoTuneOnDriverOpen"]; }
 
+- (BOOL)enableDescramble { return [_defaults boolForKey:@"enableDescramble"]; }
+- (void)setEnableDescramble:(BOOL)v { [_defaults setBool:v forKey:@"enableDescramble"]; }
+
+- (TVTestCasReaderMode)casReaderMode { return (TVTestCasReaderMode)[_defaults integerForKey:@"casReaderMode"]; }
+- (void)setCasReaderMode:(TVTestCasReaderMode)v { [_defaults setInteger:v forKey:@"casReaderMode"]; }
+
+- (nullable NSString *)casPCSCReaderName {
+    NSString *s = [_defaults stringForKey:@"casPCSCReaderName"];
+    return s.length ? s : nil;
+}
+- (void)setCasPCSCReaderName:(nullable NSString *)v { [_defaults setObject:(v ?: @"") forKey:@"casPCSCReaderName"]; }
+
+- (BOOL)enableEMMProcess { return [_defaults boolForKey:@"enableEMMProcess"]; }
+- (void)setEnableEMMProcess:(BOOL)v { [_defaults setBool:v forKey:@"enableEMMProcess"]; }
+
 - (BOOL)captionsEnabled { return [_defaults boolForKey:@"captionsEnabled"]; }
 - (void)setCaptionsEnabled:(BOOL)v { [_defaults setBool:v forKey:@"captionsEnabled"]; }
 
@@ -195,6 +224,29 @@ static NSString *SanitizeFilenameComponent(NSString *input) {
 
 - (BOOL)alwaysOnTop { return [_defaults boolForKey:@"alwaysOnTop"]; }
 - (void)setAlwaysOnTop:(BOOL)v { [_defaults setBool:v forKey:@"alwaysOnTop"]; }
+
+- (BOOL)framelessWindow { return [_defaults boolForKey:@"framelessWindow"]; }
+- (void)setFramelessWindow:(BOOL)v { [_defaults setBool:v forKey:@"framelessWindow"]; }
+
+- (BOOL)muteWhenMinimized { return [_defaults boolForKey:@"muteWhenMinimized"]; }
+- (void)setMuteWhenMinimized:(BOOL)v { [_defaults setBool:v forKey:@"muteWhenMinimized"]; }
+
+- (nullable NSString *)windowFrameString {
+    NSString *s = [_defaults stringForKey:@"windowFrameString"];
+    return s.length ? s : nil;
+}
+- (void)setWindowFrameString:(nullable NSString *)v {
+    [_defaults setObject:(v ?: @"") forKey:@"windowFrameString"];
+}
+
+- (nullable NSDictionary<NSString *, id> *)lastTunedChannelEntry {
+    id obj = [_defaults objectForKey:@"lastTunedChannelEntry"];
+    return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
+}
+- (void)setLastTunedChannelEntry:(nullable NSDictionary<NSString *, id> *)v {
+    if (v) [_defaults setObject:v forKey:@"lastTunedChannelEntry"];
+    else [_defaults removeObjectForKey:@"lastTunedChannelEntry"];
+}
 
 - (BOOL)panelVisible { return [_defaults boolForKey:@"panelVisible"]; }
 - (void)setPanelVisible:(BOOL)v { [_defaults setBool:v forKey:@"panelVisible"]; }

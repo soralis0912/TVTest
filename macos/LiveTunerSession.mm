@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "LiveTunerSession.h"
+#import "TVTestCasBridge.h"
+#import "TVTestSettings.h"
 
 #include "LibISDB.hpp"
 #include "Base/FileStream.hpp"
@@ -554,6 +556,7 @@ private:
     std::atomic<bool> _running;
     std::atomic<bool> _resetFiltersRequested;
     std::atomic<bool> _scanCancelled;
+    std::atomic<bool> _epgAcquireCancelled;
     std::atomic<uint16_t> _targetServiceID;
     std::thread _streamThread;
 
@@ -566,6 +569,10 @@ private:
 
     NSString *_epgDataPath;
     NSString *_logoCacheDir;
+
+    // TvCas B-CAS descrambler session
+    TVTestCasSession *_casSession;
+    NSString *_casLastError;
 
     // Live recording state protected by _recordLock
     std::mutex _recordLock;
@@ -651,6 +658,7 @@ private:
         return nil;
     }
     _driver.delegate = self;
+    _casSession = [[TVTestCasSession alloc] init];
     [self enumerateTuningSpaces];
     return self;
 }
@@ -735,39 +743,117 @@ private:
     return nil;
 }
 
-- (NSString *)querySmartCardStatusSummary {
-    if (!self.supportsSmartCard) {
-        return @"このドライバは内蔵スマートカードリーダー非対応です。";
+- (BOOL)isCasOpen { return _casSession.isOpen; }
+- (NSString *)casReaderName { return _casSession.readerName ?: @""; }
+- (NSString *)casCardIDText { return _casSession.cardIDText ?: @""; }
+- (uint64_t)casDescrambledPackets { return _casSession.descrambledPackets; }
+- (uint64_t)casUndescrambledPackets { return _casSession.undescrambledPackets; }
+- (uint64_t)casEcmCount { return _casSession.ecmCount; }
+- (uint64_t)casEcmErrorCount { return _casSession.ecmErrorCount; }
+- (nullable NSString *)casLastError { return _casLastError; }
+
+- (BOOL)reopenCasCardWithError:(NSError **)error {
+    [_casSession close];
+    _casLastError = nil;
+
+    TVTestSettings *settings = TVTestSettings.sharedSettings;
+    if (!settings.enableDescramble) {
+        return YES;
     }
-    id<MacBonDriverSmartCard> sc = (id<MacBonDriverSmartCard>)_driver;
+
+    _casSession.enableEMMProcess = settings.enableEMMProcess;
     NSError *err = nil;
-    BOOL openedHere = NO;
-    if (!sc.isCardOpen) {
-        if (![sc openSmartCardWithError:&err]) {
-            return [NSString stringWithFormat:@"リーダー: %@\n状態: オープン失敗 (%@)",
-                    sc.cardReaderName ?: @"内蔵リーダー", err.localizedDescription ?: @"不明"];
+    BOOL opened = NO;
+
+    switch (settings.casReaderMode) {
+        case TVTestCasReaderModeDriverBuiltIn:
+            if (self.supportsSmartCard) {
+                opened = [_casSession openWithSmartCardTransport:_driver error:&err];
+            } else {
+                err = MakeTunerError(@"このドライバは内蔵スマートカードリーダー非対応です。");
+            }
+            break;
+
+        case TVTestCasReaderModePCSC:
+            opened = [_casSession openWithPCSCReaderName:settings.casPCSCReaderName error:&err];
+            break;
+
+        case TVTestCasReaderModeAuto:
+        default:
+            if (self.supportsSmartCard) {
+                opened = [_casSession openWithSmartCardTransport:_driver error:&err];
+            }
+            if (!opened) {
+                NSError *pcscErr = nil;
+                opened = [_casSession openWithPCSCReaderName:settings.casPCSCReaderName error:&pcscErr];
+                if (!opened && pcscErr) {
+                    err = err ?: pcscErr;
+                }
+            }
+            break;
+    }
+
+    if (!opened) {
+        _casLastError = err.localizedDescription ?: @"B-CAS カードを開けませんでした。";
+        if (error) *error = err;
+        return NO;
+    }
+    return YES;
+}
+
+- (NSString *)querySmartCardStatusSummary {
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    if (_casSession.isOpen) {
+        [lines addObject:[NSString stringWithFormat:@"TvCas 状態: 接続中 (CA System: 0x%04X)", _casSession.caSystemID]];
+        [lines addObject:[NSString stringWithFormat:@"使用リーダー: %@", _casSession.readerName]];
+        [lines addObject:[NSString stringWithFormat:@"B-CAS カード ID: %@", _casSession.cardIDText]];
+        [lines addObject:[NSString stringWithFormat:@"復号パケット: %llu / 未復号: %llu / ECM: %llu (エラー: %llu)",
+                          _casSession.descrambledPackets,
+                          _casSession.undescrambledPackets,
+                          _casSession.ecmCount,
+                          _casSession.ecmErrorCount]];
+    } else if (_casLastError.length) {
+        [lines addObject:[NSString stringWithFormat:@"TvCas 状態: 未接続 (%@)", _casLastError]];
+    } else if (!TVTestSettings.sharedSettings.enableDescramble) {
+        [lines addObject:@"TvCas 状態: スクランブル解除無効"];
+    } else {
+        [lines addObject:@"TvCas 状態: 未接続"];
+    }
+
+    if (self.supportsSmartCard) {
+        id<MacBonDriverSmartCard> sc = (id<MacBonDriverSmartCard>)_driver;
+        NSError *err = nil;
+        BOOL openedHere = NO;
+        if (!sc.isCardOpen) {
+            if ([sc openSmartCardWithError:&err]) {
+                openedHere = YES;
+            }
         }
-        openedHere = YES;
+        if (sc.isCardOpen) {
+            BOOL present = NO;
+            NSData *atr = nil;
+            if ([sc isCardPresent:&present atr:&atr error:&err]) {
+                NSMutableString *atrHex = [NSMutableString string];
+                const uint8_t *b = static_cast<const uint8_t *>(atr.bytes);
+                for (NSUInteger i = 0; i < atr.length; ++i) {
+                    [atrHex appendFormat:@"%02X ", b[i]];
+                }
+                [lines addObject:[NSString stringWithFormat:@"内蔵リーダー: %@ (カード: %@, ATR: %@)",
+                                  sc.cardReaderName ?: @"内蔵リーダー",
+                                  present ? @"あり" : @"なし",
+                                  atrHex.length ? [atrHex stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] : @"-"]];
+            }
+            if (openedHere) {
+                [sc closeSmartCard];
+            }
+        }
     }
-    BOOL present = NO;
-    NSData *atr = nil;
-    BOOL ok = [sc isCardPresent:&present atr:&atr error:&err];
-    if (openedHere) {
-        [sc closeSmartCard];
+
+    NSArray<NSString *> *pcsc = [TVTestCasSession availablePCSCReaders];
+    if (pcsc.count > 0) {
+        [lines addObject:[NSString stringWithFormat:@"検出 PC/SC リーダー: %@", [pcsc componentsJoinedByString:@", "]]];
     }
-    if (!ok) {
-        return [NSString stringWithFormat:@"リーダー: %@\n状態: 確認失敗 (%@)",
-                sc.cardReaderName ?: @"内蔵リーダー", err.localizedDescription ?: @"不明"];
-    }
-    NSMutableString *atrHex = [NSMutableString string];
-    const uint8_t *b = static_cast<const uint8_t *>(atr.bytes);
-    for (NSUInteger i = 0; i < atr.length; ++i) {
-        [atrHex appendFormat:@"%02X ", b[i]];
-    }
-    return [NSString stringWithFormat:@"リーダー: %@\nカード挿入: %@\nATR: %@",
-            sc.cardReaderName ?: @"内蔵リーダー",
-            present ? @"あり" : @"なし",
-            atrHex.length ? [atrHex stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] : @"-"];
+    return [lines componentsJoinedByString:@"\n"];
 }
 
 - (BOOL)isRecording { return _isRecording.load(); }
@@ -792,6 +878,8 @@ private:
     if (![_driver openTunerWithError:error]) {
         return NO;
     }
+    // Open B-CAS card (best-effort; unencrypted streams or sample drivers still work if absent).
+    [self reopenCasCardWithError:NULL];
     _running.store(true);
     _streamThread = std::thread([self]() {
         @autoreleasepool {
@@ -808,6 +896,7 @@ private:
     if (_streamThread.joinable()) {
         _streamThread.join();
     }
+    [_casSession close];
 }
 
 - (BOOL)tuneToSpace:(NSUInteger)space
@@ -940,10 +1029,11 @@ private:
 
     while (_running.load()) {
         if (_resetFiltersRequested.exchange(false)) {
-            [_driver purgeTSStream];
+            [_casSession reset];
             parser->Reset();
             analyzer->Reset();
             captionFilter->Reset();
+            appliedServiceID = 0;
             bytesSinceLastEmit = 0;
             lastEmit = std::chrono::steady_clock::now();
         }
@@ -955,8 +1045,15 @@ private:
         }
 
         const MBDWaitResult wr = [_driver waitTSStreamWithTimeoutMs:100];
-        if (!_running.load() || wr == MBDWaitResultClosed) {
+        if (!_running.load()) {
             break;
+        }
+        if (wr == MBDWaitResultClosed) {
+            if (!_driver.isTunerOpen) {
+                break;
+            }
+            // Channel tune / purge epoch wake-up while tuner is still open; keep streaming.
+            continue;
         }
         if (wr == MBDWaitResultReady) {
             for (int burst = 0; burst < 16 && _running.load(); ++burst) {
@@ -975,6 +1072,11 @@ private:
                     break;
                 }
                 if (len > 0) {
+                    // 0. ARIB STD-B25 MULTI2 descramble in-place via TvCas
+                    if (_casSession.isOpen) {
+                        [_casSession descrambleTSBytes:chunkBuf.data() length:len];
+                    }
+
                     const uint8_t *bytes = chunkBuf.data();
                     bytesSinceLastEmit += len;
 
@@ -1117,6 +1219,80 @@ private:
 
 - (void)cancelChannelScan {
     _scanCancelled.store(true);
+}
+
+- (void)cancelEPGAcquisition {
+    _epgAcquireCancelled.store(true);
+}
+
+- (void)acquireEPGForScannedChannels:(NSArray<NSDictionary<NSString *, id> *> *)channels
+                        dwellSeconds:(double)dwellSeconds
+                          onProgress:(void (^)(NSUInteger completed, NSUInteger total, NSString *channelName))onProgress
+                          completion:(void (^)(BOOL cancelled))completion {
+    if (!_driver.isTunerOpen || channels.count == 0) {
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(NO); });
+        }
+        return;
+    }
+
+    // Deduplicate physical transponders (space, channel, streamID)
+    NSMutableArray<NSDictionary<NSString *, id> *> *unique = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (NSDictionary<NSString *, id> *entry in channels) {
+        NSString *key = [NSString stringWithFormat:@"%lu:%lu:%u",
+                         [entry[@"space"] unsignedLongValue],
+                         [entry[@"channel"] unsignedLongValue],
+                         [entry[@"streamID"] unsignedShortValue]];
+        if (![seen containsObject:key]) {
+            [seen addObject:key];
+            [unique addObject:entry];
+        }
+    }
+
+    const NSUInteger prevSpace = _driver.currentSpace;
+    const NSUInteger prevChannel = _driver.currentChannel;
+    const uint16_t prevStreamID = self.currentStreamID;
+    const double dwell = MAX(2.0, MIN(30.0, dwellSeconds));
+    _epgAcquireCancelled.store(false);
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        const NSUInteger total = unique.count;
+        for (NSUInteger i = 0; i < total; ++i) {
+            if (self->_epgAcquireCancelled.load() || !self->_running.load()) {
+                break;
+            }
+            NSDictionary<NSString *, id> *entry = unique[i];
+            NSUInteger sp = [entry[@"space"] unsignedIntegerValue];
+            NSUInteger ch = [entry[@"channel"] unsignedIntegerValue];
+            uint16_t sid = [entry[@"streamID"] unsignedShortValue];
+            NSString *label = entry[@"channelName"] ?: entry[@"name"] ?: @"";
+
+            [self tuneToSpace:sp channel:ch streamID:sid error:NULL];
+            const int steps = static_cast<int>(dwell / 0.2);
+            for (int s = 0; s < steps; ++s) {
+                if (self->_epgAcquireCancelled.load() || !self->_running.load()) break;
+                usleep(200000);
+            }
+            const NSUInteger done = i + 1;
+            if (onProgress) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    onProgress(done, total, label);
+                });
+            }
+        }
+
+        // Restore previous channel if tuner is still open
+        if (self->_running.load() && prevSpace != MBDInvalidIndex && prevChannel != MBDInvalidIndex) {
+            [self tuneToSpace:prevSpace channel:prevChannel streamID:prevStreamID error:NULL];
+        }
+        const BOOL wasCancelled = self->_epgAcquireCancelled.load();
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(wasCancelled);
+            });
+        }
+    });
 }
 
 - (void)scanSpace:(NSUInteger)spaceIndex

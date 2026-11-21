@@ -1,42 +1,34 @@
 CMAKE ?= cmake
 BUILD_JOBS ?= 8
 TVTPLAY_DIR ?= ../../TvtPlay/macos/plugin
-MACBONDRIVER_DIR ?= ../../MacBonDriver
-APP := build/TVTest.app
-CONTENTS := $(APP)/Contents
-PLUGIN := $(abspath $(CONTENTS)/PlugIns/TvtPlay.bundle)
-BONDRIVERS_DEST := $(CONTENTS)/PlugIns/BonDrivers
+BUILD_DIR := build
+APP := $(BUILD_DIR)/TVTest.app
+PLUGINS_DIR ?= $(HOME)/Library/Application Support/TVTest/PlugIns
+PLUGIN := $(PLUGINS_DIR)/TvtPlay.bundle
 
-.PHONY: all host plugin bondrivers host-binary test
-all: host plugin bondrivers
-host: host-binary $(CONTENTS)/Info.plist
+.PHONY: all app plugin test clean
+all: app
 
-host-binary:
-	$(CMAKE) -S . -B build/native -DCMAKE_BUILD_TYPE=Release
-	$(CMAKE) --build build/native --parallel $(BUILD_JOBS)
-	mkdir -p "$(CONTENTS)/MacOS"
-	install -m 755 build/native/TVTest "$(CONTENTS)/MacOS/TVTest"
+app:
+	$(CMAKE) -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build "$(BUILD_DIR)" --target TVTest --parallel $(BUILD_JOBS)
 
-$(CONTENTS)/Info.plist: Info.plist
-	mkdir -p "$(@D)"
-	cp "$<" "$@"
-
-plugin:
-	$(MAKE) -C "$(TVTPLAY_DIR)" HOST_SDK="$(CURDIR)" BUNDLE="$(PLUGIN)"
-
-bondrivers:
-	mkdir -p "$(BONDRIVERS_DEST)"
-	@if [ -d "$(MACBONDRIVER_DIR)/build/MBD_SQR100.bundle" ]; then \
-		rm -rf "$(BONDRIVERS_DEST)/MBD_SQR100.bundle"; \
-		cp -R "$(MACBONDRIVER_DIR)/build/MBD_SQR100.bundle" "$(BONDRIVERS_DEST)/MBD_SQR100.bundle"; \
-	fi
-	@if [ -d "$(MACBONDRIVER_DIR)/build/MBD_SampleUSB.bundle" ]; then \
-		rm -rf "$(BONDRIVERS_DEST)/MBD_SampleUSB.bundle"; \
-		cp -R "$(MACBONDRIVER_DIR)/build/MBD_SampleUSB.bundle" "$(BONDRIVERS_DEST)/MBD_SampleUSB.bundle"; \
+plugin: app
+	@if [ -d "$(TVTPLAY_DIR)" ]; then \
+		mkdir -p "$(PLUGINS_DIR)"; \
+		$(MAKE) -C "$(TVTPLAY_DIR)" HOST_SDK="$(CURDIR)" BUNDLE="$(PLUGIN)"; \
+		/usr/bin/codesign --force --deep --sign - "$(PLUGIN)"; \
+	else \
+		echo "Note: Optional TvtPlay plugin not found at $(TVTPLAY_DIR); skipping (TVTest built-in player will be used)."; \
 	fi
 
-test: host-binary
-	./build/native/TVTestRecordingSessionTests
-	$(CMAKE) -S ../src/LibISDB -B build/libisdb-tests -DCMAKE_BUILD_TYPE=Debug
-	$(CMAKE) --build build/libisdb-tests --target libisdbtest --parallel $(BUILD_JOBS)
-	./build/libisdb-tests/Tests/libisdbtest
+test:
+	$(CMAKE) -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build "$(BUILD_DIR)" --target TVTestRecordingSessionTests --parallel $(BUILD_JOBS)
+	./$(BUILD_DIR)/TVTestRecordingSessionTests
+	$(CMAKE) -S ../src/LibISDB -B "$(BUILD_DIR)/libisdb-tests" -DCMAKE_BUILD_TYPE=Debug
+	$(CMAKE) --build "$(BUILD_DIR)/libisdb-tests" --target libisdbtest --parallel $(BUILD_JOBS)
+	./$(BUILD_DIR)/libisdb-tests/Tests/libisdbtest
+
+clean:
+	rm -rf "$(BUILD_DIR)"

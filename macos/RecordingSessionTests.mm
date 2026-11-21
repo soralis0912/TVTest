@@ -550,7 +550,7 @@ void RunMacBonDriverLiveTest(void) {
         EXPECT(sqrErr == nil);
         if (sqr) {
             EXPECT([sqr.driverIdentifier isEqualToString:@"jp.macbondriver.sqr100"]);
-            EXPECT(sqr.tuningSpaces.count == 4); // ISDB-C, UHF, CATV Pass-Through, BS
+            EXPECT(sqr.tuningSpaces.count >= 5); // UHF, CATV Pass-Through, BS, CS110, CATV (ISDB-C)
             EXPECT(sqr.supportsTSMF);
             EXPECT(sqr.supportsSmartCard);
             EXPECT(!sqr.isTunerOpen); // Must not prematurely open USB device

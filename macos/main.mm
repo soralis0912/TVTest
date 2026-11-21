@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "TVTestPlaybackPlugin.h"
+#import "TVTestBuiltinPlayer.h"
 #import "TVTestSettings.h"
 #import "TSRecordingSession.h"
 #import "LiveTunerSession.h"
@@ -64,9 +65,11 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 
 @interface TVTestApp : NSObject <
     NSApplicationDelegate,
+    NSWindowDelegate,
     TVTestPlaybackPluginDelegate,
     TVTestSidePanelDelegate,
     TVTestLiveTunerSessionDelegate,
+    TVTestProgramGuideDelegate,
     TVTestPreferencesDelegate,
     NSMenuDelegate
 >
@@ -85,7 +88,14 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     TVTestCaptionOverlayView *_captionOverlay;
     TVTestOSDOverlayView *_osdOverlay;
     NSTextField *_statusLeft;
-    NSTextField *_statusRight;
+    NSStackView *_statusRightStack;
+    NSButton *_statusRecBtn;
+    NSButton *_statusSignalBtn;
+    NSButton *_statusCasBtn;
+    NSButton *_statusCaptionBtn;
+    NSButton *_statusVolumeBtn;
+    BOOL _mutedByMinimize;
+    BOOL _epgAcquiring;
 
     NSMenu *_recentMenu;
     NSMenu *_driverMenu;
@@ -118,6 +128,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     TVTestStreamInfoWindowController *_streamInfoWindowController;
     TVTestPreferencesWindowController *_preferencesWindowController;
     dispatch_queue_t _probeQueue;
+    id _eventMonitor;
 }
 
 - (instancetype)init {
@@ -136,6 +147,10 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 }
 
 - (void)dealloc {
+    if (_eventMonitor) {
+        [NSEvent removeMonitor:_eventMonitor];
+        _eventMonitor = nil;
+    }
     [NSNotificationCenter.defaultCenter removeObserver:self];
 }
 
@@ -476,28 +491,44 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
                                               defer:NO];
     _window.title = @"TVTest";
     _window.contentMinSize = NSMakeSize(680, 380);
-    [_window center];
+    _window.delegate = self;
+    NSString *savedFrame = TVTestSettings.sharedSettings.windowFrameString;
+    if (savedFrame.length) {
+        [_window setFrameFromString:savedFrame];
+    } else {
+        [_window center];
+    }
     [_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
-    NSURL *bundleURL = [NSBundle.mainBundle.builtInPlugInsURL URLByAppendingPathComponent:@"TvtPlay.bundle"];
-    NSBundle *bundle = [NSBundle bundleWithURL:bundleURL];
-    NSError *error = nil;
-    if (![bundle loadAndReturnError:&error]) {
-        [self showError:error.localizedDescription ?: @"アプリ内に TvtPlay.bundle がありません。"];
-        return;
+    // Optional TvtPlay.bundle plugin (prefer Application Support PlugIns, fall back to app bundle PlugIns);
+    // otherwise fall back seamlessly to TVTest's built-in playback engine.
+    NSArray<NSURL *> *pluginCandidates = @[
+        [NSURL fileURLWithPath:[TVTestSettings.sharedSettings.applicationSupportDirectory
+                                stringByAppendingPathComponent:@"PlugIns/TvtPlay.bundle"]],
+        [NSBundle.mainBundle.builtInPlugInsURL URLByAppendingPathComponent:@"TvtPlay.bundle"],
+    ];
+    for (NSURL *bundleURL in pluginCandidates) {
+        if (![NSFileManager.defaultManager fileExistsAtPath:bundleURL.path]) {
+            continue;
+        }
+        NSBundle *bundle = [NSBundle bundleWithURL:bundleURL];
+        NSError *loadErr = nil;
+        if (bundle && [bundle loadAndReturnError:&loadErr]) {
+            Class<TVTestPlaybackPlugin> playerClass = bundle.principalClass;
+            if ([playerClass conformsToProtocol:@protocol(TVTestPlaybackPlugin)] &&
+                [playerClass apiVersion] == TVTestPlaybackPluginAPIVersion) {
+                id<TVTestPlaybackPlugin> candidate = [playerClass newWithError:&loadErr];
+                if (candidate) {
+                    _plugin = candidate;
+                    break;
+                }
+            }
+        }
     }
-
-    Class<TVTestPlaybackPlugin> playerClass = bundle.principalClass;
-    if (![playerClass conformsToProtocol:@protocol(TVTestPlaybackPlugin)] ||
-        [playerClass apiVersion] != TVTestPlaybackPluginAPIVersion) {
-        [self showError:@"TvtPlay のプラグイン API バージョンが一致しません。"];
-        return;
-    }
-    _plugin = [playerClass newWithError:&error];
     if (!_plugin) {
-        [self showError:error.localizedDescription ?: @"TvtPlay を初期化できませんでした。"];
-        return;
+        NSError *builtinErr = nil;
+        _plugin = [TVTestBuiltinPlayer newWithError:&builtinErr];
     }
     _plugin.delegate = self;
 
@@ -519,6 +550,11 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 
     _sidePanelController = [[TVTestSidePanelViewController alloc] init];
     _sidePanelController.delegate = self;
+    _sidePanelController.logoLookupBlock = ^NSData * _Nullable(uint16_t sid) {
+        TVTestApp *s = weakSelf;
+        if (!s) return nil;
+        return [s->_liveSession logoPNGDataForServiceID:sid] ?: [s->_session logoPNGDataForServiceID:sid];
+    };
     NSView *panelView = _sidePanelController.view;
     [panelView.widthAnchor constraintGreaterThanOrEqualToConstant:260].active = YES;
     [panelView.widthAnchor constraintLessThanOrEqualToConstant:440].active = YES;
@@ -534,20 +570,37 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     _statusBar.translatesAutoresizingMaskIntoConstraints = NO;
     [root addSubview:_statusBar];
 
-    _statusLeft = [NSTextField labelWithString:@"⌘O またはドラッグ＆ドロップで TS / M2TS 録画を開く"];
+    _statusLeft = [NSTextField labelWithString:@"⌘O で録画を開く / ドライバメニューから TV 視聴"];
     _statusLeft.font = [NSFont systemFontOfSize:11.5];
     _statusLeft.lineBreakMode = NSLineBreakByTruncatingTail;
     _statusLeft.translatesAutoresizingMaskIntoConstraints = NO;
     [_statusBar addSubview:_statusLeft];
 
-    _statusRight = [NSTextField labelWithString:@"LibISDB 待機中"];
-    _statusRight.font = [NSFont monospacedDigitSystemFontOfSize:11.5 weight:NSFontWeightRegular];
-    _statusRight.textColor = NSColor.secondaryLabelColor;
-    _statusRight.alignment = NSTextAlignmentRight;
-    _statusRight.translatesAutoresizingMaskIntoConstraints = NO;
-    [_statusRight setContentCompressionResistancePriority:NSLayoutPriorityRequired
-                                           forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [_statusBar addSubview:_statusRight];
+    auto makeStatusBtn = ^NSButton *(NSString *title, SEL act) {
+        NSButton *b = [NSButton buttonWithTitle:title target:self action:act];
+        b.bordered = NO;
+        b.font = [NSFont monospacedDigitSystemFontOfSize:11.0 weight:NSFontWeightRegular];
+        b.contentTintColor = NSColor.secondaryLabelColor;
+        b.translatesAutoresizingMaskIntoConstraints = NO;
+        [b setContentCompressionResistancePriority:NSLayoutPriorityRequired
+                                    forOrientation:NSLayoutConstraintOrientationHorizontal];
+        return b;
+    };
+    _statusRecBtn = makeStatusBtn(@"", @selector(toggleLiveRecording:));
+    _statusRecBtn.hidden = YES;
+    _statusSignalBtn = makeStatusBtn(@"LibISDB 待機中", @selector(showStreamInfo:));
+    _statusCasBtn = makeStatusBtn(@"", @selector(showSmartCardStatus:));
+    _statusCasBtn.hidden = YES;
+    _statusCaptionBtn = makeStatusBtn(@"字幕: ON", @selector(toggleCaptions:));
+    _statusVolumeBtn = makeStatusBtn(@"🔊 100%", @selector(toggleMute:));
+
+    _statusRightStack = [NSStackView stackViewWithViews:@[
+        _statusRecBtn, _statusSignalBtn, _statusCasBtn, _statusCaptionBtn, _statusVolumeBtn
+    ]];
+    _statusRightStack.spacing = 10;
+    _statusRightStack.alignment = NSLayoutAttributeCenterY;
+    _statusRightStack.translatesAutoresizingMaskIntoConstraints = NO;
+    [_statusBar addSubview:_statusRightStack];
 
     _statusBarHeightConstraint = [_statusBar.heightAnchor constraintEqualToConstant:26];
 
@@ -565,9 +618,9 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
         _statusBarHeightConstraint,
         [_statusLeft.leadingAnchor constraintEqualToAnchor:_statusBar.leadingAnchor constant:12],
         [_statusLeft.centerYAnchor constraintEqualToAnchor:_statusBar.centerYAnchor],
-        [_statusRight.leadingAnchor constraintGreaterThanOrEqualToAnchor:_statusLeft.trailingAnchor constant:12],
-        [_statusRight.trailingAnchor constraintEqualToAnchor:_statusBar.trailingAnchor constant:-12],
-        [_statusRight.centerYAnchor constraintEqualToAnchor:_statusBar.centerYAnchor],
+        [_statusRightStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:_statusLeft.trailingAnchor constant:12],
+        [_statusRightStack.trailingAnchor constraintEqualToAnchor:_statusBar.trailingAnchor constant:-12],
+        [_statusRightStack.centerYAnchor constraintEqualToAnchor:_statusBar.centerYAnchor],
     ]];
 
     _window.contentView = root;
@@ -594,6 +647,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     ]];
 
     [self applySettingsToUI];
+    [self installWindowsTVTestInteractionMonitor];
 
     // Load persisted EPGData.dat if present
     TVTestSettings *settings = TVTestSettings.sharedSettings;
@@ -647,6 +701,26 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 - (void)applySettingsToUI {
     TVTestSettings *s = TVTestSettings.sharedSettings;
     _window.level = s.alwaysOnTop ? NSFloatingWindowLevel : NSNormalWindowLevel;
+
+    // Frameless (titlebar hidden) mode matching Windows TVTest
+    if (s.framelessWindow) {
+        _window.styleMask |= NSWindowStyleMaskFullSizeContentView;
+        _window.titlebarAppearsTransparent = YES;
+        _window.titleVisibility = NSWindowTitleHidden;
+        _window.movableByWindowBackground = YES;
+        [_window standardWindowButton:NSWindowCloseButton].hidden = YES;
+        [_window standardWindowButton:NSWindowMiniaturizeButton].hidden = YES;
+        [_window standardWindowButton:NSWindowZoomButton].hidden = YES;
+    } else {
+        _window.styleMask &= ~NSWindowStyleMaskFullSizeContentView;
+        _window.titlebarAppearsTransparent = NO;
+        _window.titleVisibility = NSWindowTitleVisible;
+        _window.movableByWindowBackground = NO;
+        [_window standardWindowButton:NSWindowCloseButton].hidden = NO;
+        [_window standardWindowButton:NSWindowMiniaturizeButton].hidden = NO;
+        [_window standardWindowButton:NSWindowZoomButton].hidden = NO;
+    }
+
     _captionOverlay.captionsEnabled = s.captionsEnabled;
     _captionOverlay.fontSize = s.captionFontSize;
     _captionOverlay.backgroundAlpha = s.captionBackgroundAlpha;
@@ -667,6 +741,48 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     [self refreshMetadataUI];
 }
 
+- (void)toggleFramelessWindow:(id)sender {
+    (void)sender;
+    TVTestSettings *s = TVTestSettings.sharedSettings;
+    s.framelessWindow = !s.framelessWindow;
+    [self applySettingsToUI];
+    [_osdOverlay showMessage:(s.framelessWindow ? @"タイトルバー: 非表示" : @"タイトルバー: 表示") subtitle:nil];
+}
+
+#pragma mark - NSWindowDelegate (Frame Persistence & Minimize Auto-Mute)
+
+- (void)windowDidMove:(NSNotification *)notification {
+    (void)notification;
+    if (!(_window.styleMask & NSWindowStyleMaskFullScreen)) {
+        TVTestSettings.sharedSettings.windowFrameString = _window.stringWithSavedFrame;
+    }
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    (void)notification;
+    if (!(_window.styleMask & NSWindowStyleMaskFullScreen)) {
+        TVTestSettings.sharedSettings.windowFrameString = _window.stringWithSavedFrame;
+    }
+}
+
+- (void)windowDidMiniaturize:(NSNotification *)notification {
+    (void)notification;
+    if (TVTestSettings.sharedSettings.muteWhenMinimized && _plugin && !_plugin.muted) {
+        _mutedByMinimize = YES;
+        [_plugin setMuted:YES];
+        [self refreshMetadataUI];
+    }
+}
+
+- (void)windowDidDeminiaturize:(NSNotification *)notification {
+    (void)notification;
+    if (_mutedByMinimize) {
+        _mutedByMinimize = NO;
+        [_plugin setMuted:NO];
+        [self refreshMetadataUI];
+    }
+}
+
 - (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
     (void)application;
     NSURL *recording = urls.firstObject;
@@ -677,6 +793,9 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
+    if (_window && !(_window.styleMask & NSWindowStyleMaskFullScreen)) {
+        TVTestSettings.sharedSettings.windowFrameString = _window.stringWithSavedFrame;
+    }
     [_liveSession closeTuner];
     _liveSession = nil;
     [_session cancel];
@@ -745,7 +864,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     _recording = url;
     _window.title = [NSString stringWithFormat:@"%@ — TVTest", url.lastPathComponent];
     _statusLeft.stringValue = [NSString stringWithFormat:@"%@ を解析中…", url.lastPathComponent];
-    _statusRight.stringValue = @"LibISDB 解析中";
+    _statusSignalBtn.title = @"LibISDB 解析中";
     [_guideWindowController resetForNewRecording];
     [_sidePanelController updateCaptions:@[]];
 
@@ -764,7 +883,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
             }
             if (!session) {
                 strongSelf->_statusLeft.stringValue = url.lastPathComponent;
-                strongSelf->_statusRight.stringValue = @"ISDB 情報なし";
+                strongSelf->_statusSignalBtn.title = @"ISDB 情報なし";
                 return;
             }
             strongSelf->_session = session;
@@ -906,40 +1025,68 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     }
 
     TVTestStreamStats *st = _currentStats ?: _currentSnapshot.streamStats;
-    NSMutableArray<NSString *> *rightParts = [NSMutableArray array];
+
     if (_liveSession.isRecording) {
         int64_t sec = (int64_t)_liveSession.recordingDuration;
         double mb = (double)_liveSession.recordedBytes / (1024.0 * 1024.0);
-        [rightParts addObject:[NSString stringWithFormat:@"● REC %02lld:%02lld:%02lld (%.1f MB)",
-                               sec / 3600, (sec / 60) % 60, sec % 60, mb]];
+        _statusRecBtn.title = [NSString stringWithFormat:@"● REC %02lld:%02lld:%02lld (%.1f MB)",
+                               sec / 3600, (sec / 60) % 60, sec % 60, mb];
+        _statusRecBtn.contentTintColor = NSColor.systemRedColor;
+        _statusRecBtn.hidden = NO;
+    } else if (_liveSession) {
+        _statusRecBtn.title = @"○ 録画";
+        _statusRecBtn.contentTintColor = NSColor.secondaryLabelColor;
+        _statusRecBtn.hidden = NO;
+    } else {
+        _statusRecBtn.hidden = YES;
     }
+
+    NSMutableArray<NSString *> *sigParts = [NSMutableArray array];
     if (_liveSession) {
-        [rightParts addObject:[NSString stringWithFormat:@"CNR %.1f dB%@",
-                               _liveSignalCNR, _liveSignalLocked ? @"" : @" (未ロック)"]];
+        [sigParts addObject:[NSString stringWithFormat:@"CNR %.1f dB%@",
+                             _liveSignalCNR, _liveSignalLocked ? @"" : @" (未ロック)"]];
     }
     if (_currentSnapshot.totTimeText.length) {
-        [rightParts addObject:_currentSnapshot.totTimeText];
+        [sigParts addObject:_currentSnapshot.totTimeText];
     }
     if (_currentSnapshot.estimatedBitrateMbps > 0.05) {
-        [rightParts addObject:[NSString stringWithFormat:@"%.1f Mbps", _currentSnapshot.estimatedBitrateMbps]];
+        [sigParts addObject:[NSString stringWithFormat:@"%.1f Mbps", _currentSnapshot.estimatedBitrateMbps]];
     }
     if (st && st.totalPackets > 0) {
-        [rightParts addObject:[NSString stringWithFormat:@"D:%llu/E:%llu",
-                               st.continuityErrorPackets,
-                               st.formatErrorPackets + st.transportErrorPackets]];
+        [sigParts addObject:[NSString stringWithFormat:@"D:%llu/E:%llu",
+                             st.continuityErrorPackets,
+                             st.formatErrorPackets + st.transportErrorPackets]];
     }
     if (_plugin.audioChannelMode != TVTestAudioChannelModeStereo) {
-        [rightParts addObject:AudioChannelModeTitle(_plugin.audioChannelMode)];
+        [sigParts addObject:AudioChannelModeTitle(_plugin.audioChannelMode)];
     }
-    if (_captionOverlay.captionsEnabled) {
-        NSString *capBadge = (_availableCaptionLanguages.count > 0 || active.hasCaptions)
-            ? @"字幕: ON"
-            : @"字幕: 待機";
-        [rightParts addObject:capBadge];
+    _statusSignalBtn.title = sigParts.count ? [sigParts componentsJoinedByString:@" · "] : @"LibISDB 待機中";
+
+    if (_liveSession) {
+        _statusCasBtn.hidden = NO;
+        if (_liveSession.isCasOpen) {
+            _statusCasBtn.title = [NSString stringWithFormat:@"CAS: ON (%llu)", _liveSession.casDescrambledPackets];
+            _statusCasBtn.contentTintColor = NSColor.systemGreenColor;
+        } else {
+            _statusCasBtn.title = @"CAS: OFF";
+            _statusCasBtn.contentTintColor = NSColor.secondaryLabelColor;
+        }
     } else {
-        [rightParts addObject:@"字幕: OFF"];
+        _statusCasBtn.hidden = YES;
     }
-    _statusRight.stringValue = rightParts.count ? [rightParts componentsJoinedByString:@"   ·   "] : @"";
+
+    if (_captionOverlay.captionsEnabled) {
+        _statusCaptionBtn.title = (_availableCaptionLanguages.count > 0 || active.hasCaptions)
+            ? @"字幕: ON" : @"字幕: 待機";
+    } else {
+        _statusCaptionBtn.title = @"字幕: OFF";
+    }
+
+    if (_plugin.muted) {
+        _statusVolumeBtn.title = @"🔇 ミュート";
+    } else {
+        _statusVolumeBtn.title = [NSString stringWithFormat:@"🔊 %ld%%", (long)_plugin.volume];
+    }
 
     [_sidePanelController updateSnapshot:_currentSnapshot
                          activeServiceID:_activeServiceID
@@ -956,6 +1103,269 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 
 - (void)sidePanelDidSelectServiceID:(uint16_t)serviceID {
     [self switchToServiceID:serviceID];
+}
+
+- (void)sidePanelDidSelectScannedChannel:(NSDictionary<NSString *, id> *)channelEntry {
+    [self tuneScannedChannelEntry:channelEntry];
+}
+
+- (void)refreshSidePanelLiveChannels {
+    if (!_liveSession) {
+        [_sidePanelController updateLiveChannels:@[]
+                                      spaceNames:@[]
+                                    currentSpace:NSUIntegerMax
+                                  currentChannel:NSUIntegerMax
+                                 activeServiceID:_activeServiceID];
+        return;
+    }
+    NSArray<NSDictionary<NSString *, id> *> *scanned =
+        [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
+    NSMutableArray<NSString *> *spaceNames = [NSMutableArray array];
+    for (TVTestTunerSpace *sp in _liveSession.tuningSpaces) {
+        [spaceNames addObject:sp.name ?: @""];
+    }
+    [_sidePanelController updateLiveChannels:scanned
+                                  spaceNames:spaceNames
+                                currentSpace:_liveSession.currentSpace
+                              currentChannel:_liveSession.currentChannel
+                             activeServiceID:_activeServiceID];
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)scannedChannelsInCurrentSpace {
+    if (!_liveSession) return @[];
+    NSArray<NSDictionary<NSString *, id> *> *all =
+        [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
+    NSMutableArray<NSDictionary<NSString *, id> *> *inSpace = [NSMutableArray array];
+    NSUInteger curSpace = _liveSession.currentSpace;
+    for (NSDictionary<NSString *, id> *e in all) {
+        if ([e[@"space"] unsignedIntegerValue] == curSpace) {
+            [inSpace addObject:e];
+        }
+    }
+    return inSpace.count > 0 ? inSpace : all;
+}
+
+- (void)stepScannedChannelBy:(NSInteger)delta {
+    NSArray<NSDictionary<NSString *, id> *> *list = [self scannedChannelsInCurrentSpace];
+    if (list.count == 0) return;
+    NSInteger curIdx = -1;
+    for (NSUInteger i = 0; i < list.count; ++i) {
+        NSDictionary *e = list[i];
+        uint16_t sid = [e[@"serviceID"] unsignedShortValue];
+        if ([e[@"space"] unsignedIntegerValue] == _liveSession.currentSpace &&
+            [e[@"channel"] unsignedIntegerValue] == _liveSession.currentChannel &&
+            (sid == 0 || sid == _activeServiceID)) {
+            curIdx = (NSInteger)i;
+            break;
+        }
+    }
+    NSInteger nextIdx = (curIdx < 0)
+        ? 0
+        : ((curIdx + delta) % (NSInteger)list.count + (NSInteger)list.count) % (NSInteger)list.count;
+    [self tuneScannedChannelEntry:list[(NSUInteger)nextIdx]];
+}
+
+- (void)selectRemoteChannelIndex:(NSUInteger)index {
+    NSArray<NSDictionary<NSString *, id> *> *list = [self scannedChannelsInCurrentSpace];
+    if (index < list.count) {
+        [self tuneScannedChannelEntry:list[index]];
+    }
+}
+
+- (NSMenu *)buildVideoContextMenu {
+    NSMenu *ctx = [[NSMenu alloc] initWithTitle:@"TVTest"];
+
+    // 1. Channel submenu (same as top-level チャンネル menu)
+    [self menuNeedsUpdate:_channelMenu];
+    NSMenuItem *chItem = [ctx addItemWithTitle:@"チャンネル" action:nil keyEquivalent:@""];
+    chItem.submenu = [_channelMenu copy];
+
+    // 2. Service submenu
+    [self menuNeedsUpdate:_serviceMenu];
+    NSMenuItem *svcItem = [ctx addItemWithTitle:@"サービス" action:nil keyEquivalent:@""];
+    svcItem.submenu = [_serviceMenu copy];
+
+    // 3. Audio submenu
+    [self menuNeedsUpdate:_audioMenu];
+    NSMenuItem *audItem = [ctx addItemWithTitle:@"音声" action:nil keyEquivalent:@""];
+    audItem.submenu = [_audioMenu copy];
+
+    [ctx addItem:[NSMenuItem separatorItem]];
+
+    // 4. Quick actions matching Windows TVTest right-click menu
+    NSMenuItem *recItem = [ctx addItemWithTitle:(_liveSession.isRecording ? @"● 録画停止" : @"録画開始")
+                                         action:@selector(toggleLiveRecording:)
+                                  keyEquivalent:@""];
+    recItem.target = self;
+    recItem.enabled = (_liveSession != nil);
+
+    NSMenuItem *capImg = [ctx addItemWithTitle:@"静止画キャプチャ (スナップショット)"
+                                        action:@selector(captureSnapshotToFile:)
+                                 keyEquivalent:@""];
+    capImg.target = self;
+
+    NSMenuItem *subToggle = [ctx addItemWithTitle:@"ARIB 字幕を表示"
+                                           action:@selector(toggleCaptions:)
+                                    keyEquivalent:@""];
+    subToggle.target = self;
+    subToggle.state = _captionOverlay.captionsEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSMenuItem *muteItem = [ctx addItemWithTitle:@"ミュート"
+                                          action:@selector(toggleMute:)
+                                   keyEquivalent:@""];
+    muteItem.target = self;
+    muteItem.state = _plugin.muted ? NSControlStateValueOn : NSControlStateValueOff;
+
+    [ctx addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *epgItem = [ctx addItemWithTitle:@"EPG 番組表…"
+                                         action:@selector(showProgramGuide:)
+                                  keyEquivalent:@""];
+    epgItem.target = self;
+
+    NSMenuItem *panelItem = [ctx addItemWithTitle:@"サイドパネルを表示"
+                                           action:@selector(toggleSidePanel:)
+                                    keyEquivalent:@""];
+    panelItem.target = self;
+    panelItem.state = TVTestSettings.sharedSettings.panelVisible ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSMenuItem *topItem = [ctx addItemWithTitle:@"常に手前に表示"
+                                         action:@selector(toggleAlwaysOnTop:)
+                                  keyEquivalent:@""];
+    topItem.target = self;
+    topItem.state = TVTestSettings.sharedSettings.alwaysOnTop ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSMenuItem *frameItem = [ctx addItemWithTitle:@"タイトルバーを隠す（フレームレス）"
+                                           action:@selector(toggleFramelessWindow:)
+                                    keyEquivalent:@""];
+    frameItem.target = self;
+    frameItem.state = TVTestSettings.sharedSettings.framelessWindow ? NSControlStateValueOn : NSControlStateValueOff;
+
+    NSMenuItem *fsItem = [ctx addItemWithTitle:@"フルスクリーン切替"
+                                        action:@selector(toggleFullScreen:)
+                                 keyEquivalent:@""];
+    fsItem.target = _window;
+
+    [ctx addItem:[NSMenuItem separatorItem]];
+
+    [self menuNeedsUpdate:_driverMenu];
+    NSMenuItem *drvItem = [ctx addItemWithTitle:@"ドライバ" action:nil keyEquivalent:@""];
+    drvItem.submenu = [_driverMenu copy];
+
+    NSMenuItem *infoItem = [ctx addItemWithTitle:@"ストリーム情報…"
+                                          action:@selector(showStreamInfo:)
+                                   keyEquivalent:@""];
+    infoItem.target = self;
+
+    NSMenuItem *prefsItem = [ctx addItemWithTitle:@"設定…"
+                                           action:@selector(showPreferences:)
+                                    keyEquivalent:@""];
+    prefsItem.target = self;
+
+    return ctx;
+}
+
+- (void)installWindowsTVTestInteractionMonitor {
+    __weak TVTestApp *weakSelf = self;
+    NSEventMask mask = NSEventMaskRightMouseDown | NSEventMaskLeftMouseDown |
+                       NSEventMaskScrollWheel | NSEventMaskKeyDown;
+    _eventMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent * _Nullable(NSEvent *event) {
+        TVTestApp *self = weakSelf;
+        if (!self || event.window != self->_window) {
+            return event;
+        }
+
+        // Right-click inside video pane -> Windows TVTest context menu
+        if (event.type == NSEventTypeRightMouseDown) {
+            NSPoint ptInVideo = [self->_videoPane convertPoint:event.locationInWindow fromView:nil];
+            if (NSPointInRect(ptInVideo, self->_videoPane.bounds)) {
+                NSMenu *menu = [self buildVideoContextMenu];
+                [NSMenu popUpContextMenu:menu withEvent:event forView:self->_videoPane];
+                return nil;
+            }
+            return event;
+        }
+
+        // Left-click: double-click video -> Fullscreen; single-click status bar -> Channel menu / Stream info
+        if (event.type == NSEventTypeLeftMouseDown) {
+            NSPoint ptInVideo = [self->_videoPane convertPoint:event.locationInWindow fromView:nil];
+            if (event.clickCount == 2 && NSPointInRect(ptInVideo, self->_videoPane.bounds)) {
+                [self->_window toggleFullScreen:nil];
+                return nil;
+            }
+            NSPoint ptInStatus = [self->_statusBar convertPoint:event.locationInWindow fromView:nil];
+            if (NSPointInRect(ptInStatus, self->_statusBar.bounds)) {
+                NSPoint ptInLeft = [self->_statusLeft convertPoint:event.locationInWindow fromView:nil];
+                if (NSPointInRect(ptInLeft, self->_statusLeft.bounds) && self->_liveSession) {
+                    [self menuNeedsUpdate:self->_channelMenu];
+                    [self->_channelMenu popUpMenuPositioningItem:nil
+                                                      atLocation:NSMakePoint(ptInStatus.x, self->_statusBar.bounds.size.height + 2)
+                                                          inView:self->_statusBar];
+                    return nil;
+                }
+            }
+            return event;
+        }
+
+        // Scroll wheel inside video pane -> Volume up/down (Shift+Wheel -> Channel up/down)
+        if (event.type == NSEventTypeScrollWheel) {
+            NSPoint ptInVideo = [self->_videoPane convertPoint:event.locationInWindow fromView:nil];
+            if (NSPointInRect(ptInVideo, self->_videoPane.bounds) && fabs(event.scrollingDeltaY) >= 1.0) {
+                if (event.modifierFlags & NSEventModifierFlagShift) {
+                    [self stepScannedChannelBy:(event.scrollingDeltaY > 0 ? -1 : 1)];
+                } else {
+                    NSInteger cur = self->_plugin.volume;
+                    NSInteger next = MAX((NSInteger)0, MIN((NSInteger)100, cur + (event.scrollingDeltaY > 0 ? 5 : -5)));
+                    [self->_plugin setVolume:next];
+                    TVTestSettings.sharedSettings.volume = next;
+                    [self->_osdOverlay showMessage:[NSString stringWithFormat:@"音量  %ld%%", (long)next] subtitle:nil];
+                }
+                return nil;
+            }
+            return event;
+        }
+
+        // Single-key Windows TVTest shortcuts when no text input has focus
+        if (event.type == NSEventTypeKeyDown) {
+            NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+            if (mods & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+                return event;
+            }
+            NSResponder *fr = self->_window.firstResponder;
+            if ([fr isKindOfClass:[NSTextView class]] || [fr isKindOfClass:[NSTextField class]]) {
+                return event;
+            }
+            NSString *chars = event.charactersIgnoringModifiers.lowercaseString;
+            if (chars.length == 1) {
+                unichar ch = [chars characterAtIndex:0];
+                if (ch >= '1' && ch <= '9') {
+                    [self selectRemoteChannelIndex:(NSUInteger)(ch - '1')];
+                    return nil;
+                }
+                if (ch == '0') {
+                    [self selectRemoteChannelIndex:9];
+                    return nil;
+                }
+                if (ch == NSPageUpFunctionKey || ch == '[') {
+                    [self stepScannedChannelBy:-1];
+                    return nil;
+                }
+                if (ch == NSPageDownFunctionKey || ch == ']') {
+                    [self stepScannedChannelBy:1];
+                    return nil;
+                }
+                if (ch == 'm') { [self toggleMute:nil]; return nil; }
+                if (ch == 's') { [self toggleSidePanel:nil]; return nil; }
+                if (ch == 'c') { [self toggleCaptions:nil]; return nil; }
+                if (ch == 'e' || ch == 'g') { [self showProgramGuide:nil]; return nil; }
+                if (ch == 'r') { [self toggleLiveRecording:nil]; return nil; }
+                if (ch == 'p') { [self captureSnapshotToFile:nil]; return nil; }
+                if (ch == 'f') { [self->_window toggleFullScreen:nil]; return nil; }
+                if (ch == 't') { [self toggleAlwaysOnTop:nil]; return nil; }
+            }
+        }
+        return event;
+    }];
 }
 
 - (void)sidePanelDidRequestSeekToTimeMs:(int64_t)timeMs {
@@ -1041,8 +1451,64 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
             empty.enabled = NO;
             return;
         }
+        NSArray<NSDictionary<NSString *, id> *> *scanned =
+            [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
+        if (scanned.count > 0) {
+            // Windows TVTest style: show only scanned channels directly, grouped by tuning space.
+            NSMutableDictionary<NSNumber *, NSMutableArray<NSDictionary<NSString *, id> *> *> *bySpace = [NSMutableDictionary dictionary];
+            for (NSDictionary<NSString *, id> *entry in scanned) {
+                NSNumber *spKey = entry[@"space"] ?: @0;
+                NSMutableArray *arr = bySpace[spKey];
+                if (!arr) {
+                    arr = [NSMutableArray array];
+                    bySpace[spKey] = arr;
+                }
+                [arr addObject:entry];
+            }
+            NSArray<NSNumber *> *sortedSpaces = [bySpace.allKeys sortedArrayUsingSelector:@selector(compare:)];
+            for (NSNumber *spKey in sortedSpaces) {
+                NSUInteger spIdx = spKey.unsignedIntegerValue;
+                NSString *spName = (spIdx < _liveSession.tuningSpaces.count)
+                    ? _liveSession.tuningSpaces[spIdx].name
+                    : [NSString stringWithFormat:@"空間 %lu", (unsigned long)spIdx];
+                NSMenuItem *spItem = [menu addItemWithTitle:spName action:nil keyEquivalent:@""];
+                spItem.state = (_liveSession.currentSpace == spIdx)
+                    ? NSControlStateValueOn : NSControlStateValueOff;
+                NSMenu *targetMenu = [[NSMenu alloc] initWithTitle:spName];
+                spItem.submenu = targetMenu;
+                for (NSDictionary<NSString *, id> *entry in bySpace[spKey]) {
+                    NSString *title = [NSString stringWithFormat:@"%@ (%@)",
+                                       entry[@"name"] ?: @"", entry[@"channelName"] ?: @""];
+                    NSMenuItem *si = [targetMenu addItemWithTitle:title
+                                                           action:@selector(selectScannedChannel:)
+                                                    keyEquivalent:@""];
+                    si.target = self;
+                    si.representedObject = entry;
+                    uint16_t sid = [entry[@"serviceID"] unsignedShortValue];
+                    BOOL isCurrent = (_liveSession.currentSpace == [entry[@"space"] unsignedIntegerValue] &&
+                                      _liveSession.currentChannel == [entry[@"channel"] unsignedIntegerValue] &&
+                                      (sid == 0 || sid == _activeServiceID));
+                    si.state = isCurrent ? NSControlStateValueOn : NSControlStateValueOff;
+                }
+            }
+        } else {
+            NSMenuItem *hint = [menu addItemWithTitle:@"未スキャン（下の「チャンネルスキャン…」を実行してください）"
+                                               action:nil
+                                        keyEquivalent:@""];
+            hint.enabled = NO;
+        }
+        [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *scanMenuItem = [menu addItemWithTitle:@"チャンネルスキャン…"
+                                                   action:@selector(showChannelScan:)
+                                            keyEquivalent:@""];
+        scanMenuItem.target = self;
+
+        // Keep raw physical channels accessible under a secondary submenu for manual tuning
+        NSMenuItem *rawRoot = [menu addItemWithTitle:@"全物理チャンネル（手動選局）" action:nil keyEquivalent:@""];
+        NSMenu *rawMenu = [[NSMenu alloc] initWithTitle:@"全物理チャンネル（手動選局）"];
+        rawRoot.submenu = rawMenu;
         for (TVTestTunerSpace *space in _liveSession.tuningSpaces) {
-            NSMenuItem *spItem = [menu addItemWithTitle:space.name action:nil keyEquivalent:@""];
+            NSMenuItem *spItem = [rawMenu addItemWithTitle:space.name action:nil keyEquivalent:@""];
             NSMenu *spMenu = [[NSMenu alloc] initWithTitle:space.name];
             spItem.submenu = spMenu;
             for (TVTestTunerChannel *ch in space.channels) {
@@ -1059,28 +1525,6 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
                     ? NSControlStateValueOn : NSControlStateValueOff;
             }
         }
-        NSArray<NSDictionary<NSString *, id> *> *scanned =
-            [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
-        if (scanned.count > 0) {
-            [menu addItem:[NSMenuItem separatorItem]];
-            NSMenuItem *scanSubRoot = [menu addItemWithTitle:@"スキャン済みチャンネル" action:nil keyEquivalent:@""];
-            NSMenu *scanSub = [[NSMenu alloc] initWithTitle:@"スキャン済みチャンネル"];
-            scanSubRoot.submenu = scanSub;
-            for (NSDictionary<NSString *, id> *entry in scanned) {
-                NSString *title = [NSString stringWithFormat:@"%@ (%@)",
-                                   entry[@"name"] ?: @"", entry[@"channelName"] ?: @""];
-                NSMenuItem *si = [scanSub addItemWithTitle:title
-                                                    action:@selector(selectScannedChannel:)
-                                             keyEquivalent:@""];
-                si.target = self;
-                si.representedObject = entry;
-            }
-        }
-        [menu addItem:[NSMenuItem separatorItem]];
-        NSMenuItem *scanMenuItem = [menu addItemWithTitle:@"チャンネルスキャン…"
-                                                   action:@selector(showChannelScan:)
-                                            keyEquivalent:@""];
-        scanMenuItem.target = self;
         return;
     } else if (menu == _recentMenu) {
         [menu removeAllItems];
@@ -1698,19 +2142,51 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     _captionOverlay.currentCue = nil;
     s.lastBonDriverPath = bundleURL.path;
 
-    if (![_plugin openLiveStreamWithServiceID:0 error:&err]) {
-        [self showError:err.localizedDescription ?: @"ライブ再生を開始できませんでした。"];
-        return;
+    NSArray<NSDictionary<NSString *, id> *> *scanned =
+        [s loadScannedChannelsForDriverIdentifier:live.driverIdentifier];
+    NSDictionary<NSString *, id> *lastEntry = s.lastTunedChannelEntry;
+    NSDictionary<NSString *, id> *firstScanned = nil;
+    if (lastEntry) {
+        NSUInteger sp = [lastEntry[@"space"] unsignedIntegerValue];
+        NSUInteger ch = [lastEntry[@"channel"] unsignedIntegerValue];
+        if (sp < live.tuningSpaces.count && ch < live.tuningSpaces[sp].channels.count) {
+            firstScanned = lastEntry;
+        }
     }
-
+    if (!firstScanned) {
+        firstScanned = scanned.firstObject;
+    }
     TVTestTunerChannel *firstCh = live.tuningSpaces.firstObject.channels.firstObject;
-    if (s.autoTuneOnDriverOpen && firstCh) {
-        [live tuneToSpace:firstCh.spaceIndex channel:firstCh.channelIndex streamID:firstCh.streamID error:NULL];
+
+    NSString *tunedLabel = @"チューナー接続完了";
+    if (s.autoTuneOnDriverOpen && firstScanned) {
+        NSUInteger sp = [firstScanned[@"space"] unsignedIntegerValue];
+        NSUInteger ch = [firstScanned[@"channel"] unsignedIntegerValue];
+        uint16_t streamID = [firstScanned[@"streamID"] unsignedShortValue];
+        uint16_t sid = [firstScanned[@"serviceID"] unsignedShortValue];
+        _activeServiceID = sid;
+        [live setActiveServiceID:sid];
+        [live tuneToSpace:sp channel:ch streamID:streamID error:NULL];
+        if (![_plugin openLiveStreamWithServiceID:sid error:&err]) {
+            [self showError:err.localizedDescription ?: @"ライブ再生を開始できませんでした。"];
+            return;
+        }
+        tunedLabel = firstScanned[@"name"] ?: firstScanned[@"channelName"] ?: @"選局完了";
+    } else {
+        if (s.autoTuneOnDriverOpen && firstCh) {
+            [live tuneToSpace:firstCh.spaceIndex channel:firstCh.channelIndex streamID:firstCh.streamID error:NULL];
+            tunedLabel = firstCh.name;
+        }
+        if (![_plugin openLiveStreamWithServiceID:0 error:&err]) {
+            [self showError:err.localizedDescription ?: @"ライブ再生を開始できませんでした。"];
+            return;
+        }
     }
 
     _window.title = [NSString stringWithFormat:@"%@ — TVTest", live.tunerName];
-    [_osdOverlay showMessage:live.tunerName subtitle:(firstCh && s.autoTuneOnDriverOpen ? firstCh.name : @"チューナー接続完了")];
+    [_osdOverlay showMessage:live.tunerName subtitle:tunedLabel];
     [_preferencesWindowController refreshDriverAndScanState];
+    [self refreshSidePanelLiveChannels];
     [self refreshMetadataUI];
 }
 
@@ -1729,7 +2205,10 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     _captionOverlay.currentCue = nil;
     _window.title = @"TVTest";
     _statusLeft.stringValue = @"⌘O で録画を開く / ⇧⌘O で MacBonDriver を開く";
-    _statusRight.stringValue = @"LibISDB 待機中";
+    _statusSignalBtn.title = @"LibISDB 待機中";
+    _statusRecBtn.hidden = YES;
+    _statusCasBtn.hidden = YES;
+    [self refreshSidePanelLiveChannels];
     [_osdOverlay showMessage:@"ドライバを閉じました" subtitle:name];
 }
 
@@ -1743,9 +2222,10 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
         [self showError:err.localizedDescription ?: @"選局に失敗しました。"];
         return;
     }
-    [_plugin purgeLiveStream];
     _activeServiceID = 0;
     _captionOverlay.currentCue = nil;
+    [_plugin openLiveStreamWithServiceID:0 error:NULL];
+    [self refreshSidePanelLiveChannels];
     [_osdOverlay showMessage:ch.name
                     subtitle:(ch.frequencyKHz > 0 ? [NSString stringWithFormat:@"%.1f MHz", (double)ch.frequencyKHz / 1000.0] : nil)];
 }
@@ -1822,7 +2302,19 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     _currentSnapshot = snapshot;
     _currentStats = stats;
     if (_activeServiceID == 0 && snapshot.services.count > 0) {
-        _activeServiceID = snapshot.services.firstObject.serviceID;
+        TVTestServiceInfo *preferred = nil;
+        for (TVTestServiceInfo *svc in snapshot.services) {
+            if (svc.videoESCount > 0) {
+                preferred = svc;
+                break;
+            }
+        }
+        if (!preferred) {
+            preferred = snapshot.services.firstObject;
+        }
+        _activeServiceID = preferred.serviceID;
+        [_liveSession setActiveServiceID:_activeServiceID];
+        [_plugin openLiveStreamWithServiceID:_activeServiceID error:NULL];
     }
     [self refreshMetadataUI];
 }
@@ -1875,6 +2367,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     (void)sender;
     if (!_guideWindowController) {
         _guideWindowController = [[TVTestProgramGuideWindowController alloc] init];
+        _guideWindowController.delegate = self;
     }
     NSArray<TVTestEPGServiceEntry *> *epg = _liveSession
         ? [_liveSession currentEPGServices]
@@ -1886,6 +2379,68 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
                                preferredServiceID:_activeServiceID
                                          finished:(_liveSession ? NO : (_session ? _epgScanFinished : YES))];
     [_guideWindowController showWindow:nil];
+}
+
+#pragma mark - TVTestProgramGuideDelegate
+
+- (void)programGuideDidRequestTuneServiceID:(uint16_t)serviceID {
+    if (_liveSession) {
+        NSArray<NSDictionary<NSString *, id> *> *scanned =
+            [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
+        for (NSDictionary<NSString *, id> *entry in scanned) {
+            if ([entry[@"serviceID"] unsignedShortValue] == serviceID) {
+                [self tuneScannedChannelEntry:entry];
+                return;
+            }
+        }
+    }
+    [self switchToServiceID:serviceID];
+}
+
+- (void)programGuideDidRequestAcquireEPG {
+    if (!_liveSession) {
+        [self showError:@"EPG 取得には MacBonDriver への接続が必要です。"];
+        return;
+    }
+    if (_epgAcquiring) {
+        [_liveSession cancelEPGAcquisition];
+        [_guideWindowController setEPGAcquisitionStatus:@"EPG 取得を中止しています…" acquiring:YES];
+        return;
+    }
+    NSArray<NSDictionary<NSString *, id> *> *scanned =
+        [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:_liveSession.driverIdentifier];
+    if (scanned.count == 0) {
+        [self showError:@"先にチャンネルスキャンを実行してください。"];
+        return;
+    }
+    _epgAcquiring = YES;
+    [_guideWindowController setEPGAcquisitionStatus:@"EPG 取得を開始しています…" acquiring:YES];
+    [_osdOverlay showMessage:@"EPG 取得開始" subtitle:@"各チャンネルを巡回して番組表を取得します"];
+
+    __weak TVTestApp *weakSelf = self;
+    [_liveSession acquireEPGForScannedChannels:scanned
+                                  dwellSeconds:6.0
+                                    onProgress:^(NSUInteger completed, NSUInteger total, NSString *channelName) {
+        TVTestApp *s = weakSelf;
+        if (!s) return;
+        NSString *msg = [NSString stringWithFormat:@"EPG 取得中 (%lu / %lu): %@",
+                         (unsigned long)completed, (unsigned long)total, channelName];
+        [s->_guideWindowController setEPGAcquisitionStatus:msg acquiring:YES];
+        [s->_osdOverlay showMessage:@"EPG 取得中" subtitle:msg];
+    }
+                                    completion:^(BOOL cancelled) {
+        TVTestApp *s = weakSelf;
+        if (!s) return;
+        s->_epgAcquiring = NO;
+        NSString *doneMsg = cancelled ? @"EPG 取得を中止しました" : @"EPG 取得が完了しました";
+        [s->_guideWindowController setEPGAcquisitionStatus:doneMsg acquiring:NO];
+        [s->_osdOverlay showMessage:doneMsg subtitle:nil];
+        if (s->_liveSession) {
+            [s->_plugin openLiveStreamWithServiceID:s->_activeServiceID error:NULL];
+            NSArray<TVTestEPGServiceEntry *> *epg = [s->_liveSession currentEPGServices];
+            [s->_guideWindowController updateWithEPGServices:epg preferredServiceID:s->_activeServiceID finished:YES];
+        }
+    }];
 }
 
 - (void)showProgramSearch:(id)sender {
@@ -1912,8 +2467,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
     [_streamInfoWindowController showWindow:nil];
 }
 
-- (void)selectScannedChannel:(NSMenuItem *)sender {
-    NSDictionary<NSString *, id> *entry = sender.representedObject;
+- (void)tuneScannedChannelEntry:(NSDictionary<NSString *, id> *)entry {
     if (!_liveSession || !entry) return;
     NSUInteger sp = [entry[@"space"] unsignedIntegerValue];
     NSUInteger ch = [entry[@"channel"] unsignedIntegerValue];
@@ -1924,15 +2478,18 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
         [self showError:err.localizedDescription ?: @"選局に失敗しました。"];
         return;
     }
-    [_plugin purgeLiveStream];
     _activeServiceID = sid;
-    if (sid != 0) {
-        [_liveSession setActiveServiceID:sid];
-        [_plugin openLiveStreamWithServiceID:sid error:NULL];
-    }
+    TVTestSettings.sharedSettings.lastTunedChannelEntry = entry;
+    [_liveSession setActiveServiceID:sid];
+    [_plugin openLiveStreamWithServiceID:sid error:NULL];
     _captionOverlay.currentCue = nil;
+    [self refreshSidePanelLiveChannels];
     [_osdOverlay showMessage:(entry[@"name"] ?: entry[@"channelName"] ?: @"選局")
                     subtitle:entry[@"channelName"]];
+}
+
+- (void)selectScannedChannel:(NSMenuItem *)sender {
+    [self tuneScannedChannelEntry:sender.representedObject];
 }
 
 - (void)showChannelScan:(id)sender {
@@ -1958,6 +2515,7 @@ static NSString *AudioChannelModeTitle(TVTestAudioChannelMode mode) {
 - (void)preferencesDidSaveScannedChannels:(NSArray<NSDictionary<NSString *, id> *> *)channels
                       forDriverIdentifier:(NSString *)driverIdentifier {
     (void)driverIdentifier;
+    [self refreshSidePanelLiveChannels];
     [_osdOverlay showMessage:@"チャンネルスキャン結果を保存しました"
                     subtitle:[NSString stringWithFormat:@"%lu チャンネル", (unsigned long)channels.count]];
 }

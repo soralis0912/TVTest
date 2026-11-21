@@ -14,6 +14,7 @@ typedef NS_ENUM(NSInteger, TVTestSidePanelTab) {
 @protocol TVTestSidePanelDelegate <NSObject>
 @optional
 - (void)sidePanelDidSelectServiceID:(uint16_t)serviceID;
+- (void)sidePanelDidSelectScannedChannel:(NSDictionary<NSString *, id> *)channelEntry;
 - (void)sidePanelDidRequestSeekToTimeMs:(int64_t)timeMs;
 - (void)sidePanelDidRequestExportCaptions;
 - (void)sidePanelDidChangeSelectedTab:(TVTestSidePanelTab)tab;
@@ -21,6 +22,7 @@ typedef NS_ENUM(NSInteger, TVTestSidePanelTab) {
 
 @interface TVTestSidePanelViewController : NSViewController
 @property (nonatomic, weak, nullable) id<TVTestSidePanelDelegate> delegate;
+@property (nonatomic, copy, nullable) NSData * _Nullable (^logoLookupBlock)(uint16_t serviceID);
 @property (nonatomic) TVTestSidePanelTab selectedTab;
 
 - (void)updateSnapshot:(nullable TVTestRecordingSnapshot *)snapshot
@@ -28,6 +30,11 @@ typedef NS_ENUM(NSInteger, TVTestSidePanelTab) {
              videoSize:(NSSize)videoSize
                  stats:(nullable TVTestStreamStats *)stats
                session:(nullable TVTestRecordingSession *)session;
+- (void)updateLiveChannels:(NSArray<NSDictionary<NSString *, id> *> *)scannedChannels
+                spaceNames:(NSArray<NSString *> *)spaceNames
+              currentSpace:(NSUInteger)space
+            currentChannel:(NSUInteger)channel
+           activeServiceID:(uint16_t)serviceID;
 - (void)updateEPGServices:(NSArray<TVTestEPGServiceEntry *> *)services
           activeServiceID:(uint16_t)serviceID;
 - (void)updateCaptions:(NSArray<TVTestCaptionCue *> *)cues;

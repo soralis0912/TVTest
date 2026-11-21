@@ -11,9 +11,17 @@
     // Tab 0: Info
     NSTextView *_infoTextView;
 
-    // Tab 1: Channels
+    // Tab 1: Channels (Windows TVTest style: space selector + scanned channels in live mode, or TS services)
+    NSPopUpButton *_spacePopup;
     NSTableView *_channelTable;
     NSArray<TVTestServiceInfo *> *_services;
+    NSArray<NSDictionary<NSString *, id> *> *_allScannedChannels;
+    NSArray<NSDictionary<NSString *, id> *> *_visibleScannedChannels;
+    NSArray<NSNumber *> *_availableSpaceIndices;
+    NSArray<NSString *> *_spaceNames;
+    NSUInteger _selectedSpaceFilter;
+    NSUInteger _currentLiveSpace;
+    NSUInteger _currentLiveChannel;
     uint16_t _activeServiceID;
     __weak TVTestRecordingSession *_session;
 
@@ -34,6 +42,13 @@
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _services = @[];
+        _allScannedChannels = @[];
+        _visibleScannedChannels = @[];
+        _availableSpaceIndices = @[];
+        _spaceNames = @[];
+        _selectedSpaceFilter = NSUIntegerMax;
+        _currentLiveSpace = NSUIntegerMax;
+        _currentLiveChannel = NSUIntegerMax;
         _serviceEvents = @[];
         _allCaptions = @[];
         _filteredCaptions = @[];
@@ -99,16 +114,29 @@
 
 - (void)buildChannelTab {
     NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"channel"];
+    NSView *container = [[NSView alloc] init];
+
+    _spacePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _spacePopup.controlSize = NSControlSizeSmall;
+    _spacePopup.target = self;
+    _spacePopup.action = @selector(spaceFilterChanged:);
+    _spacePopup.hidden = YES;
+    _spacePopup.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:_spacePopup];
+
     NSScrollView *scroll = [[NSScrollView alloc] init];
     scroll.hasVerticalScroller = YES;
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    [container addSubview:scroll];
 
     _channelTable = [[NSTableView alloc] init];
     _channelTable.usesAlternatingRowBackgroundColors = YES;
-    _channelTable.rowHeight = 42.0;
+    _channelTable.rowHeight = 40.0;
     _channelTable.headerView = nil;
     _channelTable.dataSource = self;
     _channelTable.delegate = self;
     _channelTable.target = self;
+    _channelTable.action = @selector(channelClicked:);
     _channelTable.doubleAction = @selector(channelDoubleClicked:);
 
     NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:@"channel"];
@@ -117,7 +145,18 @@
     [_channelTable addTableColumn:col];
 
     scroll.documentView = _channelTable;
-    item.view = scroll;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_spacePopup.topAnchor constraintEqualToAnchor:container.topAnchor constant:4],
+        [_spacePopup.leadingAnchor constraintEqualToAnchor:container.leadingAnchor constant:8],
+        [_spacePopup.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-8],
+        [scroll.topAnchor constraintEqualToAnchor:_spacePopup.bottomAnchor constant:4],
+        [scroll.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+    ]];
+
+    item.view = container;
     [_tabView addTabViewItem:item];
 }
 
@@ -389,9 +428,90 @@
     }
 }
 
+- (void)updateLiveChannels:(NSArray<NSDictionary<NSString *, id> *> *)scannedChannels
+                spaceNames:(NSArray<NSString *> *)spaceNames
+              currentSpace:(NSUInteger)space
+            currentChannel:(NSUInteger)channel
+           activeServiceID:(uint16_t)serviceID {
+    _allScannedChannels = [scannedChannels copy] ?: @[];
+    _spaceNames = [spaceNames copy] ?: @[];
+    _currentLiveSpace = space;
+    _currentLiveChannel = channel;
+    _activeServiceID = serviceID;
+
+    NSMutableSet<NSNumber *> *spSet = [NSMutableSet set];
+    for (NSDictionary<NSString *, id> *e in _allScannedChannels) {
+        [spSet addObject:(e[@"space"] ?: @0)];
+    }
+    _availableSpaceIndices = [[spSet allObjects] sortedArrayUsingSelector:@selector(compare:)];
+
+    [_spacePopup removeAllItems];
+    if (_availableSpaceIndices.count > 0) {
+        _spacePopup.hidden = NO;
+        for (NSNumber *spNum in _availableSpaceIndices) {
+            NSUInteger idx = spNum.unsignedIntegerValue;
+            NSString *title = (idx < _spaceNames.count)
+                ? _spaceNames[idx]
+                : [NSString stringWithFormat:@"空間 %lu", (unsigned long)idx];
+            [_spacePopup addItemWithTitle:title];
+        }
+        if (_selectedSpaceFilter == NSUIntegerMax ||
+            ![_availableSpaceIndices containsObject:@(_selectedSpaceFilter)]) {
+            _selectedSpaceFilter = [_availableSpaceIndices containsObject:@(space)]
+                ? space
+                : _availableSpaceIndices.firstObject.unsignedIntegerValue;
+        }
+        NSUInteger popIdx = [_availableSpaceIndices indexOfObject:@(_selectedSpaceFilter)];
+        if (popIdx != NSNotFound) {
+            [_spacePopup selectItemAtIndex:(NSInteger)popIdx];
+        }
+        [self rebuildVisibleScannedChannels];
+    } else {
+        _spacePopup.hidden = YES;
+        _visibleScannedChannels = @[];
+        [_channelTable reloadData];
+    }
+}
+
+- (void)rebuildVisibleScannedChannels {
+    NSMutableArray<NSDictionary<NSString *, id> *> *filtered = [NSMutableArray array];
+    for (NSDictionary<NSString *, id> *e in _allScannedChannels) {
+        if ([e[@"space"] unsignedIntegerValue] == _selectedSpaceFilter) {
+            [filtered addObject:e];
+        }
+    }
+    _visibleScannedChannels = filtered;
+    [_channelTable reloadData];
+}
+
+- (void)spaceFilterChanged:(NSPopUpButton *)sender {
+    NSInteger idx = sender.indexOfSelectedItem;
+    if (idx >= 0 && (NSUInteger)idx < _availableSpaceIndices.count) {
+        _selectedSpaceFilter = _availableSpaceIndices[(NSUInteger)idx].unsignedIntegerValue;
+        [self rebuildVisibleScannedChannels];
+    }
+}
+
+- (void)channelClicked:(id)sender {
+    (void)sender;
+    NSInteger row = _channelTable.clickedRow;
+    if (row < 0) return;
+    if (_visibleScannedChannels.count > 0 && (NSUInteger)row < _visibleScannedChannels.count) {
+        if ([_delegate respondsToSelector:@selector(sidePanelDidSelectScannedChannel:)]) {
+            [_delegate sidePanelDidSelectScannedChannel:_visibleScannedChannels[(NSUInteger)row]];
+        }
+    }
+}
+
 - (void)channelDoubleClicked:(id)sender {
     (void)sender;
     NSInteger row = _channelTable.selectedRow;
+    if (_visibleScannedChannels.count > 0 && row >= 0 && (NSUInteger)row < _visibleScannedChannels.count) {
+        if ([_delegate respondsToSelector:@selector(sidePanelDidSelectScannedChannel:)]) {
+            [_delegate sidePanelDidSelectScannedChannel:_visibleScannedChannels[(NSUInteger)row]];
+        }
+        return;
+    }
     if (row >= 0 && (NSUInteger)row < _services.count) {
         if ([_delegate respondsToSelector:@selector(sidePanelDidSelectServiceID:)]) {
             [_delegate sidePanelDidSelectServiceID:_services[(NSUInteger)row].serviceID];
@@ -440,7 +560,11 @@
 #pragma mark - NSTableViewDataSource / Delegate
 
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView {
-    if (tableView == _channelTable) return (NSInteger)_services.count;
+    if (tableView == _channelTable) {
+        return (_visibleScannedChannels.count > 0)
+            ? (NSInteger)_visibleScannedChannels.count
+            : (NSInteger)_services.count;
+    }
     if (tableView == _programTable) return (NSInteger)_serviceEvents.count;
     if (tableView == _captionTable) return (NSInteger)_filteredCaptions.count;
     return 0;
@@ -449,6 +573,75 @@
 - (nullable NSView *)tableView:(NSTableView *)tableView
             viewForTableColumn:(nullable NSTableColumn *)tableColumn
                            row:(NSInteger)row {
+    if (tableView == _channelTable && _visibleScannedChannels.count > 0 &&
+        row >= 0 && (NSUInteger)row < _visibleScannedChannels.count) {
+        NSDictionary<NSString *, id> *entry = _visibleScannedChannels[(NSUInteger)row];
+        NSUInteger sp = [entry[@"space"] unsignedIntegerValue];
+        NSUInteger ch = [entry[@"channel"] unsignedIntegerValue];
+        uint16_t sid = [entry[@"serviceID"] unsignedShortValue];
+        BOOL isCurrent = (sp == _currentLiveSpace && ch == _currentLiveChannel &&
+                          (sid == 0 || sid == _activeServiceID));
+
+        NSView *cell = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 270, 40)];
+        NSTextField *title = [NSTextField labelWithString:
+            [NSString stringWithFormat:@"%@%@", isCurrent ? @"▶ " : @"", entry[@"name"] ?: @""]];
+        title.font = isCurrent
+            ? [NSFont boldSystemFontOfSize:12.5]
+            : [NSFont systemFontOfSize:12.5];
+        title.lineBreakMode = NSLineBreakByTruncatingTail;
+        title.translatesAutoresizingMaskIntoConstraints = NO;
+
+        NSString *subText = entry[@"channelName"] ?: @"";
+        if (isCurrent) {
+            for (TVTestServiceInfo *svc in _services) {
+                if (svc.serviceID == sid && svc.currentProgram.title.length) {
+                    subText = svc.currentProgram.title;
+                    break;
+                }
+            }
+        }
+        NSTextField *sub = [NSTextField labelWithString:subText];
+        sub.font = [NSFont systemFontOfSize:11.0];
+        sub.textColor = NSColor.secondaryLabelColor;
+        sub.lineBreakMode = NSLineBreakByTruncatingTail;
+        sub.translatesAutoresizingMaskIntoConstraints = NO;
+
+        NSStackView *vStack = [NSStackView stackViewWithViews:@[title, sub]];
+        vStack.orientation = NSUserInterfaceLayoutOrientationVertical;
+        vStack.alignment = NSLayoutAttributeLeading;
+        vStack.spacing = 1;
+        vStack.translatesAutoresizingMaskIntoConstraints = NO;
+
+        NSData *logoData = _logoLookupBlock ? _logoLookupBlock(sid) : [_session logoPNGDataForServiceID:sid];
+        NSImage *logoImg = logoData ? [[NSImage alloc] initWithData:logoData] : nil;
+        if (logoImg) {
+            NSImageView *iv = [[NSImageView alloc] init];
+            iv.image = logoImg;
+            iv.imageScaling = NSImageScaleProportionallyUpOrDown;
+            iv.translatesAutoresizingMaskIntoConstraints = NO;
+            [iv.widthAnchor constraintEqualToConstant:36].active = YES;
+            [iv.heightAnchor constraintEqualToConstant:22].active = YES;
+            NSStackView *h = [NSStackView stackViewWithViews:@[iv, vStack]];
+            h.spacing = 6;
+            h.alignment = NSLayoutAttributeCenterY;
+            h.translatesAutoresizingMaskIntoConstraints = NO;
+            [cell addSubview:h];
+            [NSLayoutConstraint activateConstraints:@[
+                [h.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:6],
+                [h.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-6],
+                [h.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+            ]];
+        } else {
+            [cell addSubview:vStack];
+            [NSLayoutConstraint activateConstraints:@[
+                [vStack.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor constant:8],
+                [vStack.trailingAnchor constraintEqualToAnchor:cell.trailingAnchor constant:-8],
+                [vStack.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+            ]];
+        }
+        return cell;
+    }
+
     if (tableView == _channelTable && row >= 0 && (NSUInteger)row < _services.count) {
         TVTestServiceInfo *svc = _services[(NSUInteger)row];
         NSView *cell = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 270, 42)];
@@ -469,7 +662,7 @@
         sub.lineBreakMode = NSLineBreakByTruncatingTail;
         sub.translatesAutoresizingMaskIntoConstraints = NO;
 
-        NSData *logoData = [_session logoPNGDataForServiceID:svc.serviceID];
+        NSData *logoData = _logoLookupBlock ? _logoLookupBlock(svc.serviceID) : [_session logoPNGDataForServiceID:svc.serviceID];
         NSImage *logoImg = logoData ? [[NSImage alloc] initWithData:logoData] : nil;
 
         NSStackView *vStack = [NSStackView stackViewWithViews:@[title, sub]];

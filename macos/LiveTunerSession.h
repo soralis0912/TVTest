@@ -83,6 +83,16 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL supportsSmartCard;
 @property (nonatomic, readonly, copy, nullable) NSString *cardReaderName;
 
+// CAS / B-CAS (TvCas) runtime state
+@property (nonatomic, readonly) BOOL isCasOpen;
+@property (nonatomic, readonly, copy) NSString *casReaderName;
+@property (nonatomic, readonly, copy) NSString *casCardIDText;
+@property (nonatomic, readonly) uint64_t casDescrambledPackets;
+@property (nonatomic, readonly) uint64_t casUndescrambledPackets;
+@property (nonatomic, readonly) uint64_t casEcmCount;
+@property (nonatomic, readonly) uint64_t casEcmErrorCount;
+@property (nonatomic, readonly, copy, nullable) NSString *casLastError;
+
 @property (nonatomic, readonly) BOOL isRecording;
 @property (nonatomic, readonly, nullable) NSURL *recordingURL;
 @property (nonatomic, readonly) uint64_t recordedBytes;
@@ -107,6 +117,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setActiveServiceID:(uint16_t)serviceID;
 
 - (BOOL)setLNBPowerMode:(MBDLNBPowerMode)mode error:(NSError **)error;
+- (BOOL)reopenCasCardWithError:(NSError **)error;
 - (NSString *)querySmartCardStatusSummary;
 
 // Live TS recording using LibISDB::ServiceSelectorFilter + FileStreamPOSIX.
@@ -121,6 +132,13 @@ NS_ASSUME_NONNULL_BEGIN
        onProgress:(void (^)(NSUInteger completed, NSUInteger total, TVTestChannelScanResult *result))onProgress
        completion:(void (^)(NSArray<TVTestChannelScanResult *> *results, BOOL cancelled))completion;
 - (void)cancelChannelScan;
+
+// Cycles across unique physical channels in scannedChannels to populate EPGData.dat.
+- (void)acquireEPGForScannedChannels:(NSArray<NSDictionary<NSString *, id> *> *)channels
+                        dwellSeconds:(double)dwellSeconds
+                          onProgress:(void (^)(NSUInteger completed, NSUInteger total, NSString *channelName))onProgress
+                          completion:(void (^)(BOOL cancelled))completion;
+- (void)cancelEPGAcquisition;
 
 - (NSArray<TVTestEPGServiceEntry *> *)currentEPGServices;
 - (NSArray<TVTestCaptionCue *> *)allCaptionCuesForLanguageTag:(uint8_t)languageTag;

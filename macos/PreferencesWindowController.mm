@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #import "PreferencesWindowController.h"
+#import "TVTestCasBridge.h"
 #import "TVTestSettings.h"
 #import "TVTestPlaybackPlugin.h"
 #import <QuartzCore/QuartzCore.h>
@@ -22,6 +23,8 @@
     // 1: View
     NSButton *_osdCheck;
     NSButton *_topMostCheck;
+    NSButton *_framelessCheck;
+    NSButton *_muteMinCheck;
     NSButton *_panelLeftCheck;
     NSButton *_statusBarCheck;
     NSButton *_controlsHiddenCheck;
@@ -79,6 +82,13 @@
     // 8: EPG
     NSButton *_saveEPGCheck;
     NSPopUpButton *_epgViewModePopup;
+
+    // 9: CAS / B-CAS (TvCas)
+    NSButton *_casEnableCheck;
+    NSPopUpButton *_casReaderModePopup;
+    NSPopUpButton *_casPCSCReaderPopup;
+    NSButton *_casEMMCheck;
+    NSTextField *_casStatusLabel;
 }
 
 - (instancetype)init {
@@ -103,6 +113,7 @@
             @"録画",
             @"ARIB 字幕",
             @"EPG / 番組表",
+            @"CAS / B-CAS",
         ];
         _discoveredDrivers = @[];
         _scanResults = [NSMutableArray array];
@@ -145,6 +156,7 @@
     [self buildRecordPage];
     [self buildCaptionPage];
     [self buildEPGPage];
+    [self buildCASPage];
 
     [NSLayoutConstraint activateConstraints:@[
         [sideScroll.topAnchor constraintEqualToAnchor:content.topAnchor constant:12],
@@ -239,6 +251,10 @@
                                      target:self action:@selector(applySettings:)];
     _topMostCheck = [NSButton checkboxWithTitle:@"常に最前面に表示する"
                                          target:self action:@selector(applySettings:)];
+    _framelessCheck = [NSButton checkboxWithTitle:@"タイトルバーを隠す（フレームレス表示）"
+                                           target:self action:@selector(applySettings:)];
+    _muteMinCheck = [NSButton checkboxWithTitle:@"最小化時に自動でミュートする"
+                                         target:self action:@selector(applySettings:)];
     _panelLeftCheck = [NSButton checkboxWithTitle:@"サイドパネルを左側に配置する"
                                            target:self action:@selector(applySettings:)];
     _statusBarCheck = [NSButton checkboxWithTitle:@"ステータスバーを表示する"
@@ -247,7 +263,7 @@
                                                 target:self action:@selector(applySettings:)];
 
     NSStackView *stack = [NSStackView stackViewWithViews:@[
-        _osdCheck, _topMostCheck, _panelLeftCheck, _statusBarCheck, _controlsHiddenCheck
+        _osdCheck, _topMostCheck, _framelessCheck, _muteMinCheck, _panelLeftCheck, _statusBarCheck, _controlsHiddenCheck
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
@@ -717,6 +733,70 @@
     [_pageTabs addTabViewItem:item];
 }
 
+- (void)buildCASPage {
+    NSTabViewItem *item = [[NSTabViewItem alloc] initWithIdentifier:@"cas"];
+    NSView *v = [[NSView alloc] init];
+
+    _casEnableCheck = [NSButton checkboxWithTitle:@"スクランブル解除を有効にする (ARIB STD-B25 / TvCas)"
+                                           target:self action:@selector(applySettings:)];
+
+    _casReaderModePopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_casReaderModePopup addItemsWithTitles:@[
+        @"自動（ドライバ内蔵リーダー優先 → PC/SC）",
+        @"ドライバ内蔵リーダーのみ（XIT-SQR100 等）",
+        @"PC/SC USB カードリーダーを使用",
+    ]];
+    _casReaderModePopup.target = self;
+    _casReaderModePopup.action = @selector(applySettings:);
+
+    _casPCSCReaderPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [_casPCSCReaderPopup addItemWithTitle:@"自動選択（最初に見つかったリーダー）"];
+    _casPCSCReaderPopup.target = self;
+    _casPCSCReaderPopup.action = @selector(applySettings:);
+
+    NSButton *refreshPcscBtn = [NSButton buttonWithTitle:@"再検出"
+                                                  target:self action:@selector(refreshPCSCReadersInPrefs:)];
+    NSStackView *pcscRow = [NSStackView stackViewWithViews:@[_casPCSCReaderPopup, refreshPcscBtn]];
+    pcscRow.spacing = 6;
+
+    _casEMMCheck = [NSButton checkboxWithTitle:@"EMM 処理を有効にする（B-CAS カード情報更新）"
+                                        target:self action:@selector(applySettings:)];
+
+    NSButton *reloadCardBtn = [NSButton buttonWithTitle:@"B-CAS カードを再読み込み"
+                                                 target:self action:@selector(reloadCasCardInPrefs:)];
+
+    _casStatusLabel = [NSTextField wrappingLabelWithString:@"TvCas 状態: チューナー未接続"];
+    _casStatusLabel.font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular];
+    _casStatusLabel.textColor = NSColor.secondaryLabelColor;
+
+    NSGridView *grid = [NSGridView gridViewWithViews:@[
+        @[[NSTextField labelWithString:@"カードリーダー方式:"], _casReaderModePopup],
+        @[[NSTextField labelWithString:@"PC/SC リーダー:"], pcscRow],
+    ]];
+    grid.rowSpacing = 10;
+    grid.columnSpacing = 10;
+    [grid columnAtIndex:0].xPlacement = NSGridCellPlacementTrailing;
+
+    NSStackView *stack = [NSStackView stackViewWithViews:@[
+        _casEnableCheck, grid, _casEMMCheck, reloadCardBtn, _casStatusLabel
+    ]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 12;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [v addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:v.topAnchor constant:14],
+        [stack.leadingAnchor constraintEqualToAnchor:v.leadingAnchor constant:8],
+        [stack.trailingAnchor constraintEqualToAnchor:v.trailingAnchor constant:-8],
+        [_casPCSCReaderPopup.widthAnchor constraintGreaterThanOrEqualToConstant:260],
+    ]];
+
+    item.view = v;
+    [_pageTabs addTabViewItem:item];
+}
+
 #pragma mark - Load / Save
 
 - (void)loadFromSettings {
@@ -728,6 +808,8 @@
 
     _osdCheck.state = s.osdEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     _topMostCheck.state = s.alwaysOnTop ? NSControlStateValueOn : NSControlStateValueOff;
+    _framelessCheck.state = s.framelessWindow ? NSControlStateValueOn : NSControlStateValueOff;
+    _muteMinCheck.state = s.muteWhenMinimized ? NSControlStateValueOn : NSControlStateValueOff;
     _panelLeftCheck.state = s.panelOnLeft ? NSControlStateValueOn : NSControlStateValueOff;
     _statusBarCheck.state = s.statusBarVisible ? NSControlStateValueOn : NSControlStateValueOff;
     _controlsHiddenCheck.state = s.controlsHidden ? NSControlStateValueOn : NSControlStateValueOff;
@@ -765,6 +847,11 @@
 
     _saveEPGCheck.state = s.saveEPGData ? NSControlStateValueOn : NSControlStateValueOff;
     [_epgViewModePopup selectItemAtIndex:MAX((NSInteger)0, MIN((NSInteger)1, s.epgDefaultViewMode))];
+
+    _casEnableCheck.state = s.enableDescramble ? NSControlStateValueOn : NSControlStateValueOff;
+    [_casReaderModePopup selectItemAtIndex:MAX((NSInteger)0, MIN((NSInteger)2, (NSInteger)s.casReaderMode))];
+    _casEMMCheck.state = s.enableEMMProcess ? NSControlStateValueOn : NSControlStateValueOff;
+    [self refreshPCSCReadersInPrefs:nil];
 
     [self updatePreviews];
     [self refreshDriverAndScanState];
@@ -824,6 +911,15 @@
         _scanDriverLabel.stringValue = @"接続中ドライバ: なし（「ドライバ」タブまたはメニューから接続してください）";
         _scanStartStopBtn.enabled = NO;
     }
+
+    if (live) {
+        _casStatusLabel.stringValue = [live querySmartCardStatusSummary];
+    } else {
+        NSArray<NSString *> *pcsc = [TVTestCasSession availablePCSCReaders];
+        _casStatusLabel.stringValue = pcsc.count > 0
+            ? [NSString stringWithFormat:@"チューナー未接続\n検出 PC/SC リーダー: %@", [pcsc componentsJoinedByString:@", "]]
+            : @"チューナー未接続（ドライバ接続時に XIT-SQR100 内蔵リーダーまたは PC/SC リーダーを自動使用します）";
+    }
 }
 
 - (void)applySettings:(id)sender {
@@ -835,6 +931,8 @@
 
     s.osdEnabled = (_osdCheck.state == NSControlStateValueOn);
     s.alwaysOnTop = (_topMostCheck.state == NSControlStateValueOn);
+    s.framelessWindow = (_framelessCheck.state == NSControlStateValueOn);
+    s.muteWhenMinimized = (_muteMinCheck.state == NSControlStateValueOn);
     s.panelOnLeft = (_panelLeftCheck.state == NSControlStateValueOn);
     s.statusBarVisible = (_statusBarCheck.state == NSControlStateValueOn);
     s.controlsHidden = (_controlsHiddenCheck.state == NSControlStateValueOn);
@@ -870,6 +968,12 @@
     s.saveEPGData = (_saveEPGCheck.state == NSControlStateValueOn);
     s.epgDefaultViewMode = MAX((NSInteger)0, MIN((NSInteger)1, _epgViewModePopup.indexOfSelectedItem));
 
+    s.enableDescramble = (_casEnableCheck.state == NSControlStateValueOn);
+    s.casReaderMode = (TVTestCasReaderMode)MAX((NSInteger)0, MIN((NSInteger)2, _casReaderModePopup.indexOfSelectedItem));
+    s.casPCSCReaderName = (_casPCSCReaderPopup.indexOfSelectedItem > 0)
+        ? _casPCSCReaderPopup.titleOfSelectedItem : @"";
+    s.enableEMMProcess = (_casEMMCheck.state == NSControlStateValueOn);
+
     [self updatePreviews];
     [s notifyChanged];
 }
@@ -894,9 +998,43 @@
         ? [_delegate preferencesCurrentLiveSession] : nil;
     if (!live) return;
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"内蔵スマートカード状態";
+    alert.messageText = @"スマートカード / TvCas 状態";
     alert.informativeText = [live querySmartCardStatusSummary];
     [alert beginSheetModalForWindow:self.window completionHandler:nil];
+}
+
+- (void)refreshPCSCReadersInPrefs:(id)sender {
+    (void)sender;
+    NSString *saved = TVTestSettings.sharedSettings.casPCSCReaderName;
+    [_casPCSCReaderPopup removeAllItems];
+    [_casPCSCReaderPopup addItemWithTitle:@"自動選択（最初に見つかったリーダー）"];
+    NSArray<NSString *> *readers = [TVTestCasSession availablePCSCReaders];
+    for (NSString *r in readers) {
+        [_casPCSCReaderPopup addItemWithTitle:r];
+    }
+    if (saved.length) {
+        NSInteger idx = [_casPCSCReaderPopup indexOfItemWithTitle:saved];
+        if (idx >= 0) {
+            [_casPCSCReaderPopup selectItemAtIndex:idx];
+        } else {
+            [_casPCSCReaderPopup addItemWithTitle:saved];
+            [_casPCSCReaderPopup selectItemAtIndex:_casPCSCReaderPopup.numberOfItems - 1];
+        }
+    }
+}
+
+- (void)reloadCasCardInPrefs:(id)sender {
+    (void)sender;
+    [self applySettings:nil];
+    TVTestLiveTunerSession *live = [_delegate respondsToSelector:@selector(preferencesCurrentLiveSession)]
+        ? [_delegate preferencesCurrentLiveSession] : nil;
+    if (!live) {
+        [self refreshDriverAndScanState];
+        return;
+    }
+    NSError *err = nil;
+    [live reopenCasCardWithError:&err];
+    [self refreshDriverAndScanState];
 }
 
 - (void)toggleChannelScan:(id)sender {
@@ -931,28 +1069,32 @@
          onProgress:^(NSUInteger completed, NSUInteger total, TVTestChannelScanResult *result) {
         TVTestPreferencesWindowController *s = weakSelf;
         if (!s) return;
-        [s->_scanResults addObject:result];
-        [s->_scanResultTable reloadData];
-        [s->_scanResultTable scrollRowToVisible:(NSInteger)s->_scanResults.count - 1];
+        if (result.locked || result.services.count > 0) {
+            [s->_scanResults addObject:result];
+            [s->_scanResultTable reloadData];
+            [s->_scanResultTable scrollRowToVisible:(NSInteger)s->_scanResults.count - 1];
+        }
         s->_scanProgress.doubleValue = total > 0 ? ((double)completed / (double)total) * 100.0 : 100.0;
-        s->_scanStatusLabel.stringValue = [NSString stringWithFormat:@"スキャン中 (%lu / %lu): %@ (CNR %.1f dB)",
+        s->_scanStatusLabel.stringValue = [NSString stringWithFormat:@"スキャン中 (%lu / %lu): %@ (CNR %.1f dB) — 検出 %lu ch",
                                            (unsigned long)completed, (unsigned long)total,
-                                           result.channelName, result.signalCNR];
+                                           result.channelName, result.signalCNR,
+                                           (unsigned long)s->_scanResults.count];
     }
          completion:^(NSArray<TVTestChannelScanResult *> *results, BOOL cancelled) {
+        (void)results;
         TVTestPreferencesWindowController *s = weakSelf;
         if (!s) return;
         s->_scanning = NO;
         s->_scanStartStopBtn.title = @"スキャン開始";
-        NSUInteger lockedCount = 0;
-        for (TVTestChannelScanResult *r in results) {
-            if (r.locked) ++lockedCount;
+        s->_scanSaveBtn.enabled = (s->_scanResults.count > 0);
+        if (!cancelled && s->_scanResults.count > 0) {
+            [s saveChannelScanResults:nil];
+        } else {
+            s->_scanStatusLabel.stringValue = cancelled
+                ? [NSString stringWithFormat:@"スキャン中止（%lu チャンネル検出 — 「保存」で反映可能）",
+                   (unsigned long)s->_scanResults.count]
+                : @"スキャン完了（チャンネルが見つかりませんでした）";
         }
-        s->_scanSaveBtn.enabled = (lockedCount > 0);
-        s->_scanStatusLabel.stringValue = cancelled
-            ? [NSString stringWithFormat:@"スキャン中止（%lu チャンネルでロック検出）", (unsigned long)lockedCount]
-            : [NSString stringWithFormat:@"スキャン完了（%lu / %lu チャンネルでロック検出）",
-               (unsigned long)lockedCount, (unsigned long)results.count];
     }];
 }
 
@@ -963,8 +1105,17 @@
     if (!live) return;
 
     NSMutableArray<NSDictionary<NSString *, id> *> *flat = [NSMutableArray array];
+    NSInteger scannedSpace = _scanSpacePopup.indexOfSelectedItem;
+    // Preserve scanned channels from other spaces when rescanning one space
+    NSArray<NSDictionary<NSString *, id> *> *existing =
+        [TVTestSettings.sharedSettings loadScannedChannelsForDriverIdentifier:live.driverIdentifier];
+    for (NSDictionary<NSString *, id> *entry in existing) {
+        if ([entry[@"space"] integerValue] != scannedSpace) {
+            [flat addObject:entry];
+        }
+    }
     for (TVTestChannelScanResult *r in _scanResults) {
-        if (!r.locked) continue;
+        if (!r.locked && r.services.count == 0) continue;
         if (r.services.count > 0) {
             [flat addObjectsFromArray:r.services];
         } else {
